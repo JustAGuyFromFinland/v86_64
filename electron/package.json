@@ -1,0 +1,58 @@
+{
+  "name": "v86-electron",
+  "version": "0.1.0",
+  "private": true,
+  "main": "app/main.js",
+  "description": "Fullscreen Electron wrapper for the v86 emulator with WebGPU-first rendering and worker-ready core.",
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^6.4.2",
+    "@electron-forge/maker-deb": "^6.4.2",
+    "@electron-forge/maker-dmg": "^6.4.2",
+    "@electron-forge/maker-rpm": "^6.4.2",
+    "@electron-forge/maker-squirrel": "^6.4.2",
+    "@electron-forge/maker-zip": "^6.4.2",
+    "@electron-forge/plugin-auto-unpack-natives": "^6.4.2",
+    "electron": "^30.0.0"
+  },
+  "config": {
+    "forge": {
+      "packagerConfig": {
+        "asar": true,
+        "executableName": "v86"
+      },
+      "plugins": [],
+      "makers": [
+        {
+          "name": "@electron-forge/maker-squirrel",
+          "config": {
+            "name": "v86"
+          }
+        },
+        {
+          "name": "@electron-forge/maker-zip",
+          "platforms": ["darwin", "linux", "win32"]
+        },
+        {
+          "name": "@electron-forge/maker-dmg",
+          "platforms": ["darwin"]
+        },
+        {
+          "name": "@electron-forge/maker-deb",
+          "platforms": ["linux"]
+        },
+        {
+          "name": "@electron-forge/maker-rpm",
+          "platforms": ["linux"]
+        }
+      ]
+    }
+  }
+}
