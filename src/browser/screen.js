@@ -114,7 +114,10 @@ export function ScreenAdapter(options, screen_fill_buffer)
 
         // render loop state
         timer_id = 0,
-        paused = false;
+        paused = false,
+
+        // webgpu worker state
+        canvas_transferred = false;
 
     // 0x12345 -> "#012345"
     function number_as_color(n)
@@ -662,8 +665,12 @@ export function ScreenAdapter(options, screen_fill_buffer)
 
         graphic_screen.style.display = "block";
 
-        graphic_screen.width = width;
-        graphic_screen.height = height;
+        // Once the canvas is transferred to an OffscreenCanvas, resizing must happen in the worker.
+        if(!canvas_transferred)
+        {
+            graphic_screen.width = width;
+            graphic_screen.height = height;
+        }
 
         // graphic_context must be reconfigured whenever its graphic_screen is resized
         graphic_context.imageSmoothingEnabled = false;
@@ -918,6 +925,11 @@ export function ScreenAdapter(options, screen_fill_buffer)
         }
     };
 
+    this.update_buffer_webgpu = function(payload)
+    {
+        // DOM-based adapter ignores WebGPU payloads.
+    };
+
     // XXX: duplicated in DummyScreenAdapter
     this.get_text_screen = function()
     {
@@ -947,9 +959,11 @@ export function ScreenAdapter(options, screen_fill_buffer)
 }
 
 // WebGPU-powered screen adapter for graphical modes. Text mode stays DOM-based.
+/** @constructor @suppress {checkTypes,globalThis} */
 export function WebGPUScreenAdapter(options, screen_fill_buffer)
 {
-    if(!navigator.gpu)
+    const gpu = /** @type {?Object} */ (navigator["gpu"]);
+    if(!gpu)
     {
         throw new Error("WebGPU is required but navigator.gpu is unavailable");
     }
@@ -1021,15 +1035,30 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
     const charmap = get_charmap(options.encoding);
 
     // WebGPU state
-    const canvas_context = graphic_screen.getContext("webgpu");
-    if(!canvas_context)
+    const prefer_webgpu_worker = options.use_webgpu_worker ?? globalThis.USE_WEBGPU_WORKER ?? false;
+    let use_webgpu_worker = prefer_webgpu_worker;
+    const worker_supported = typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined";
+
+    const GPU_TEX = globalThis.GPUTextureUsage ?? { COPY_SRC: 0x1, COPY_DST: 0x2, TEXTURE_BINDING: 0x4, STORAGE_BINDING: 0x8, RENDER_ATTACHMENT: 0x10 };
+    const GPU_BUF = globalThis.GPUBufferUsage ?? { MAP_READ: 0x1, MAP_WRITE: 0x2, COPY_SRC: 0x4, COPY_DST: 0x8, INDEX: 0x10, VERTEX: 0x20, UNIFORM: 0x40, STORAGE: 0x80, INDIRECT: 0x100, QUERY_RESOLVE: 0x200 };
+    const GPU_STAGE = globalThis.GPUShaderStage ?? { VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4 };
+
+    let canvas_transferred = false;
+
+    // When enabled, a dedicated worker owns WebGPU and the OffscreenCanvas.
+    let webgpu_worker = null;
+    let webgpu_worker_ready = Promise.resolve(false);
+
+    // Main-thread WebGPU context (used when worker is disabled/unavailable).
+    const canvas_context = use_webgpu_worker && worker_supported ? null : graphic_screen.getContext("webgpu");
+    if(!use_webgpu_worker && !canvas_context)
     {
         throw new Error("Failed to acquire WebGPU canvas context");
     }
 
     // Use rgba8unorm to guarantee storage texture support without requiring optional features.
     const canvas_format = "rgba8unorm";
-    const adapterPromise = navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    const adapterPromise = gpu.requestAdapter({ powerPreference: "high-performance" });
 
     let device = null;
     let queue = null;
@@ -1062,6 +1091,76 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
             throw new Error("WebGPU adapter unavailable (enable chrome://flags/#enable-unsafe-webgpu or use a compatible browser)");
         }
 
+        if(use_webgpu_worker && worker_supported)
+        {
+            const worker_base = (typeof document !== "undefined" && document.baseURI) ? document.baseURI : (typeof location !== "undefined" ? location.href : undefined);
+            const worker_relative = "src/browser/webgpu_worker.js";
+            const worker_url = worker_base ? new URL(worker_relative, worker_base).toString() : worker_relative;
+            webgpu_worker = new Worker(worker_url, { type: "module" });
+
+            // Probe worker WebGPU capability before transferring the canvas.
+            const worker_probe = new Promise(resolve => {
+                let settled = false;
+                const finish = ok => {
+                    if(!settled)
+                    {
+                        settled = true;
+                        resolve(!!ok);
+                    }
+                };
+                webgpu_worker.onmessage = ev => {
+                    if(ev.data?.type === "probe-result")
+                    {
+                        finish(ev.data.ok);
+                    }
+                    else if(ev.data?.type === "error")
+                    {
+                        finish(false);
+                    }
+                };
+                webgpu_worker.onerror = () => finish(false);
+                webgpu_worker.postMessage({ type: "probe" });
+            });
+
+            const worker_ok = await worker_probe;
+            if(worker_ok)
+            {
+                const offscreen = graphic_screen.transferControlToOffscreen();
+                canvas_transferred = true;
+                webgpu_worker_ready = new Promise(resolve => {
+                    webgpu_worker.onmessage = ev => {
+                        if(ev.data?.type === "ready")
+                        {
+                            resolve(true);
+                        }
+                        else if(ev.data?.type === "error")
+                        {
+                            resolve(false);
+                        }
+                    };
+                    webgpu_worker.onerror = () => resolve(false);
+                });
+
+                webgpu_worker.postMessage({
+                    type: "init",
+                    canvas: offscreen,
+                    adapterOptions: { powerPreference: "high-performance" },
+                    width: graphic_screen.width,
+                    height: graphic_screen.height,
+                }, [offscreen]);
+
+                // No further main-thread WebGPU initialization required.
+                return;
+            }
+            else
+            {
+                webgpu_worker.terminate();
+                webgpu_worker = null;
+                use_webgpu_worker = false;
+                // Fall through to main-thread WebGPU setup.
+            }
+        }
+
         device = await adapter.requestDevice();
         queue = device.queue;
 
@@ -1069,7 +1168,7 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
             device,
             format: canvas_format,
             alphaMode: "opaque",
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+            usage: GPU_TEX.RENDER_ATTACHMENT | GPU_TEX.COPY_DST,
         });
 
         const shader_module = device.createShaderModule({
@@ -1311,12 +1410,12 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
 
         bind_group_layout = device.createBindGroupLayout({
             entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: canvas_format, viewDimension: "2d" } },
-                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+                { binding: 0, visibility: GPU_STAGE.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 1, visibility: GPU_STAGE.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 2, visibility: GPU_STAGE.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 3, visibility: GPU_STAGE.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 4, visibility: GPU_STAGE.COMPUTE, storageTexture: { access: "write-only", format: canvas_format, viewDimension: "2d" } },
+                { binding: 5, visibility: GPU_STAGE.COMPUTE, buffer: { type: "uniform" } },
             ],
         });
 
@@ -1345,7 +1444,7 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
         frame_texture = device.createTexture({
             size: { width, height },
             format: canvas_format,
-            usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.STORAGE_BINDING,
+            usage: GPU_TEX.COPY_SRC | GPU_TEX.STORAGE_BINDING,
         });
     }
 
@@ -1431,8 +1530,22 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
 
     this.set_size_graphical = function(width, height, buffer_width, buffer_height)
     {
-        graphic_screen.width = width;
-        graphic_screen.height = height;
+        if(use_webgpu_worker && worker_supported && canvas_transferred)
+        {
+            // After transfer, resize must be driven from the worker side only (canvas.width/height in worker).
+            webgpu_worker_ready.then(() => {
+                webgpu_worker?.postMessage({ type: "resize", width, height });
+            });
+        }
+        else
+        {
+            graphic_screen.width = width;
+            graphic_screen.height = height;
+        }
+
+        // Keep DOM size in sync for layout/scale even when worker owns the canvas.
+        graphic_screen.style.width = width + "px";
+        graphic_screen.style.height = height + "px";
 
         if(width <= 640 && width * 2 < window.innerWidth * window.devicePixelRatio &&
             height * 2 < window.innerHeight * window.devicePixelRatio)
@@ -1446,14 +1559,17 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
 
         update_scale_graphic();
 
-        if(device)
+        if(!use_webgpu_worker || !worker_supported)
         {
-            canvas_context.configure({
-                device,
-                format: canvas_format,
-                alphaMode: "opaque",
-                usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-            });
+            if(device)
+            {
+                canvas_context.configure({
+                    device,
+                    format: canvas_format,
+                    alphaMode: "opaque",
+                    usage: GPU_TEX.RENDER_ATTACHMENT | GPU_TEX.COPY_DST,
+                });
+            }
         }
     };
 
@@ -1752,7 +1868,7 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
             const temp_texture = device.createTexture({
                 size: { width: image_data.width, height: image_data.height },
                 format: canvas_format,
-                usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+                usage: GPU_TEX.COPY_DST | GPU_TEX.COPY_SRC,
             });
 
             device.queue.writeTexture(
@@ -1782,6 +1898,17 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
 
     this.update_buffer_webgpu = function(payload)
     {
+        if(use_webgpu_worker && worker_supported)
+        {
+            webgpu_worker_ready.then(() => {
+                if(!webgpu_worker) return;
+
+                // Avoid transferring buffers; some callers reuse them, causing detach errors in Electron.
+                webgpu_worker.postMessage({ type: "render", payload });
+            });
+            return;
+        }
+
         if(!device || !compute_pipeline)
         {
             return;
@@ -1793,18 +1920,18 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
         ensure_frame_texture(texture_width, texture_height);
 
         const pixel_data = payload.pixel_buffer;
-        pixel_buffer_gpu = ensure_buffer(pixel_buffer_gpu, pixel_data.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-pixel-buffer");
+        pixel_buffer_gpu = ensure_buffer(pixel_buffer_gpu, pixel_data.byteLength, GPU_BUF.STORAGE | GPU_BUF.COPY_DST, "vga-pixel-buffer");
         queue.writeBuffer(pixel_buffer_gpu, 0, pixel_data);
 
-        palette_buffer_gpu = ensure_buffer(palette_buffer_gpu, payload.palette.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-palette-buffer");
+        palette_buffer_gpu = ensure_buffer(palette_buffer_gpu, payload.palette.byteLength, GPU_BUF.STORAGE | GPU_BUF.COPY_DST, "vga-palette-buffer");
         queue.writeBuffer(palette_buffer_gpu, 0, payload.palette);
 
-        dac_map_buffer_gpu = ensure_buffer(dac_map_buffer_gpu, payload.dac_map.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-dac-map");
+        dac_map_buffer_gpu = ensure_buffer(dac_map_buffer_gpu, payload.dac_map.byteLength, GPU_BUF.STORAGE | GPU_BUF.COPY_DST, "vga-dac-map");
         queue.writeBuffer(dac_map_buffer_gpu, 0, payload.dac_map);
 
         if(payload.planes)
         {
-            plane_buffer_gpu = ensure_buffer(plane_buffer_gpu, payload.planes.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-planes");
+            plane_buffer_gpu = ensure_buffer(plane_buffer_gpu, payload.planes.byteLength, GPU_BUF.STORAGE | GPU_BUF.COPY_DST, "vga-planes");
             queue.writeBuffer(plane_buffer_gpu, 0, payload.planes);
         }
         else
@@ -1824,7 +1951,7 @@ export function WebGPUScreenAdapter(options, screen_fill_buffer)
         params_array[9] = payload.pel_width >>> 0;
         params_array[10] = payload.start_address >>> 0;
 
-        params_buffer_gpu = ensure_buffer(params_buffer_gpu, params_array.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, "vga-params");
+        params_buffer_gpu = ensure_buffer(params_buffer_gpu, params_array.byteLength, GPU_BUF.UNIFORM | GPU_BUF.COPY_DST, "vga-params");
         queue.writeBuffer(params_buffer_gpu, 0, params_array);
 
         const bind_group = device.createBindGroup({

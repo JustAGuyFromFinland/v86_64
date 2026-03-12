@@ -2,7 +2,7 @@
   "name": "v86-electron",
   "version": "0.1.0",
   "private": true,
-  "main": "app/main.js",
+  "main": "main.js",
   "description": "Fullscreen Electron wrapper for the v86 emulator with WebGPU-first rendering and worker-ready core.",
   "scripts": {
     "start": "electron-forge start",

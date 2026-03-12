@@ -4,6 +4,10 @@
 <title>v86 (debug)</title>
 <meta name="viewport" content="width=device-width,minimum-scale=1.0,maximum-scale=1.0,user-scalable=no,interactive-widget=resizes-content">
 
+<script>
+// Prefer WebGPU worker rendering in debug build; override via console if needed.
+window.USE_WEBGPU_WORKER = true;
+</script>
 <script src="build/capstone-x86.min.js"></script>
 <script src="build/libwabt.cjs"></script>
 <script type="module" src="src/browser/main.js"></script>

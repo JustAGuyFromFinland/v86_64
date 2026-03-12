@@ -105,6 +105,10 @@ export function DummyScreenAdapter(options)
     {
     };
 
+    this.update_buffer_webgpu = function(payload)
+    {
+    };
+
     this.get_text_screen = function()
     {
         var screen = [];

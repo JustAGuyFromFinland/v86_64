@@ -8,6 +8,10 @@
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="192.png">
 
+<script>
+// Prefer WebGPU worker rendering in browsers when supported; can be overridden via URL params or console.
+window.USE_WEBGPU_WORKER = true;
+</script>
 <script src="build/v86_all.js?98e7110c2"></script>
 <link rel="stylesheet" href="v86.css">
 
