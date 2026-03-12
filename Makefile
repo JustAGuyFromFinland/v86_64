@@ -70,13 +70,13 @@ CLOSURE_FLAGS=\
 CARGO_FLAGS_SAFE=\
 		--target wasm32-unknown-unknown \
 		-- \
-		-C linker=tools/rust-lld-wrapper \
-		-C link-args="--import-table --global-base=4096 $(STRIP_DEBUG_FLAG)" \
+		-C linker=C:/Users/Krugex/.rustup/toolchains/stable-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe \
+		-C link-args="--import-table $(STRIP_DEBUG_FLAG)" \
 		-C link-args="build/softfloat.o" \
 		-C link-args="build/zstddeclib.o" \
 		--verbose
 
-CARGO_FLAGS=$(CARGO_FLAGS_SAFE) -C target-feature=+bulk-memory -C target-feature=+multivalue -C target-feature=+simd128
+CARGO_FLAGS=$(CARGO_FLAGS_SAFE) -C target-feature=+bulk-memory -C target-feature=+multivalue -C target-feature=+simd128 -C target-feature=+relaxed-simd
 
 CORE_FILES=cjs.js const.js io.js main.js lib.js buffer.js ide.js pci.js floppy.js \
 	   dma.js pit.js vga.js ps2.js rtc.js uart.js \
