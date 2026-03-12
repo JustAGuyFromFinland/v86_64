@@ -30,6 +30,11 @@ list of emulated hardware:
 - Various virtio devices: Filesystem, network and balloon.
 - A SoundBlaster 16 sound card.
 
+## Rendering
+
+- The browser build now uses WebGPU for graphical output; a WebGPU-capable browser (Chrome/Edge with WebGPU enabled) is required. Initialization fails fast when WebGPU is unavailable.
+- Text mode remains DOM-based; only graphical VGA/SVGA paths render through WebGPU. The Electron renderer is unchanged.
+
 ## Demos
 
 [9front](https://copy.sh/v86/?profile=9front) —

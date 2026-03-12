@@ -13,7 +13,7 @@ import { FetchNetworkAdapter } from "./fetch_network.js";
 import { WispNetworkAdapter } from "./wisp_network.js";
 import { KeyboardAdapter } from "./keyboard.js";
 import { MouseAdapter } from "./mouse.js";
-import { ScreenAdapter } from "./screen.js";
+import { ScreenAdapter, WebGPUScreenAdapter } from "./screen.js";
 import { DummyScreenAdapter } from "./dummy_screen.js";
 import { SerialAdapter, VirtioConsoleAdapter, SerialAdapterXtermJS, VirtioConsoleAdapterXtermJS } from "./serial.js";
 import { InBrowserNetworkAdapter } from "./inbrowser_network.js";
@@ -271,7 +271,7 @@ V86.prototype.continue_init = async function(emulator, options)
 
     if(screen_options.container)
     {
-        this.screen_adapter = new ScreenAdapter(screen_options, () => this.v86.cpu.devices.vga && this.v86.cpu.devices.vga.screen_fill_buffer());
+        this.screen_adapter = new WebGPUScreenAdapter(screen_options, () => this.v86.cpu.devices.vga && this.v86.cpu.devices.vga.screen_fill_buffer());
     }
     else
     {

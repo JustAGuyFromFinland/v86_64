@@ -40,6 +40,8 @@ export function ScreenAdapter(options, screen_fill_buffer)
         screen_container.appendChild(graphic_screen);
     }
     const graphic_context = graphic_screen.getContext("2d", { alpha: false });
+    this.graphic_screen = graphic_screen;
+    this.graphic_context = graphic_context;
 
     let text_screen = screen_container.getElementsByTagName("div")[0];
     if(!text_screen)
@@ -942,4 +944,993 @@ export function ScreenAdapter(options, screen_fill_buffer)
     };
 
     this.init();
+}
+
+// WebGPU-powered screen adapter for graphical modes. Text mode stays DOM-based.
+export function WebGPUScreenAdapter(options, screen_fill_buffer)
+{
+    if(!navigator.gpu)
+    {
+        throw new Error("WebGPU is required but navigator.gpu is unavailable");
+    }
+
+    const screen_container = options.container;
+    console.assert(screen_container, "options.container must be provided");
+
+    const MODE_TEXT = 0;
+    const MODE_GRAPHICAL = 1;
+
+    const CHARACTER_INDEX = 0;
+    const FLAGS_INDEX = 1;
+    const BG_COLOR_INDEX = 2;
+    const FG_COLOR_INDEX = 3;
+    const TEXT_BUF_COMPONENT_SIZE = 4;
+
+    const FLAG_BLINKING = 0x01;
+    const FLAG_FONT_PAGE_B = 0x02;
+
+    this.FLAG_BLINKING = FLAG_BLINKING;
+    this.FLAG_FONT_PAGE_B = FLAG_FONT_PAGE_B;
+    this.use_webgpu = true;
+
+    let graphic_screen = screen_container.getElementsByTagName("canvas")[0];
+    if(!graphic_screen)
+    {
+        graphic_screen = document.createElement("canvas");
+        screen_container.appendChild(graphic_screen);
+    }
+
+    let text_screen = screen_container.getElementsByTagName("div")[0];
+    if(!text_screen)
+    {
+        text_screen = document.createElement("div");
+        screen_container.appendChild(text_screen);
+    }
+
+    const cursor_element = document.createElement("div");
+
+    // Text-mode state (copied from ScreenAdapter to preserve behaviour)
+    let cursor_row;
+    let cursor_col;
+    let scale_x = options.scale !== undefined ? options.scale : 1;
+    let scale_y = options.scale !== undefined ? options.scale : 1;
+    let base_scale = 1;
+    let changed_rows;
+    let mode;
+    let text_mode_data;
+    let text_mode_width;
+    let text_mode_height;
+    let font_context;
+    let font_image_data;
+    let font_is_visible = new Int8Array(8 * 256);
+    let font_height;
+    let font_width;
+    let font_width_9px;
+    let font_width_dbl;
+    let font_copy_8th_col;
+    let font_page_a = 0;
+    let font_page_b = 0;
+    let blink_visible;
+    let tm_last_update = 0;
+    let cursor_start;
+    let cursor_end;
+    let cursor_enabled;
+    let text_mode_paused = false;
+    let text_timer_id = 0;
+
+    const charmap = get_charmap(options.encoding);
+
+    // WebGPU state
+    const canvas_context = graphic_screen.getContext("webgpu");
+    if(!canvas_context)
+    {
+        throw new Error("Failed to acquire WebGPU canvas context");
+    }
+
+    // Use rgba8unorm to guarantee storage texture support without requiring optional features.
+    const canvas_format = "rgba8unorm";
+    const adapterPromise = navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+
+    let device = null;
+    let queue = null;
+    let compute_pipeline = null;
+    let bind_group_layout = null;
+    let frame_texture = null;
+    let frame_texture_size = { width: 0, height: 0 };
+    let pixel_buffer_gpu = null;
+    let palette_buffer_gpu = null;
+    let dac_map_buffer_gpu = null;
+    let plane_buffer_gpu = null;
+    let params_buffer_gpu = null;
+
+    const WORKGROUP_SIZE = 8;
+    const MODE_VGA_PLANAR = 0;
+    const MODE_VGA_4BPP = 1;
+    const MODE_VGA_8BPP = 2;
+    const MODE_SVGA_8BPP = 3;
+    const MODE_SVGA_15BPP = 4;
+    const MODE_SVGA_16BPP = 5;
+    const MODE_SVGA_24BPP = 6;
+    const MODE_SVGA_32BPP = 7;
+
+    const params_array = new Uint32Array(11);
+
+    const init_promise = adapterPromise.then(async adapter =>
+    {
+        if(!adapter)
+        {
+            throw new Error("WebGPU adapter unavailable (enable chrome://flags/#enable-unsafe-webgpu or use a compatible browser)");
+        }
+
+        device = await adapter.requestDevice();
+        queue = device.queue;
+
+        canvas_context.configure({
+            device,
+            format: canvas_format,
+            alphaMode: "opaque",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+        });
+
+        const shader_module = device.createShaderModule({
+                label: "v86-vga-webgpu",
+                code: `struct Params {
+        width: u32,
+        height: u32,
+        mask: u32,
+        colorset: u32,
+        mode: u32,
+        color_plane_enable: u32,
+        addr_shift: u32,
+        addr_substitution: u32,
+        shift_mode: u32,
+        pel_width: u32,
+        start_address: u32,
+    };
+
+    @group(0) @binding(0) var<storage, read> pixel_indices: array<u32>;
+    @group(0) @binding(1) var<storage, read> palette: array<u32>;
+    @group(0) @binding(2) var<storage, read> dac_map: array<u32>;
+    @group(0) @binding(3) var<storage, read> vga_planes: array<u32>;
+    @group(0) @binding(4) var out_image: texture_storage_2d<rgba8unorm, write>;
+    @group(0) @binding(5) var<uniform> params: Params;
+
+    fn decode_palette(color: u32) -> vec4<f32> {
+        let r = f32((color >> 16u) & 0xFFu) / 255.0;
+        let g = f32((color >> 8u) & 0xFFu) / 255.0;
+        let b = f32(color & 0xFFu) / 255.0;
+        return vec4<f32>(r, g, b, 1.0);
+    }
+
+    fn load_plane_byte(addr: u32) -> u32 {
+        let word: u32 = vga_planes[addr >> 2u];
+        let shift: u32 = (addr & 3u) * 8u;
+        return (word >> shift) & 0xFFu;
+    }
+
+    fn vga_planar_color(idx: u32, virtual_width: u32) -> u32 {
+        let pixel_addr: u32 = idx;
+        var addr: u32 = (pixel_addr >> params.addr_shift) + params.start_address;
+
+        if(params.addr_substitution != 0u) {
+            var row: u32 = pixel_addr / virtual_width;
+            var col: u32 = pixel_addr - virtual_width * row;
+
+            switch params.addr_substitution {
+                case 1u: {
+                    addr = (row & 1u) << 13u;
+                    row = row >> 1u;
+                }
+                case 2u: {
+                    addr = (row & 1u) << 14u;
+                    row = row >> 1u;
+                }
+                case 3u: {
+                    addr = (row & 3u) << 13u;
+                    row = row >> 2u;
+                }
+                default: {}
+            }
+
+            addr = addr | (((row * virtual_width + col) >> params.addr_shift) + params.start_address);
+        }
+
+        let b0: u32 = load_plane_byte(addr);
+        let b1: u32 = load_plane_byte(addr + 0x10000u);
+        let b2: u32 = load_plane_byte(addr + 0x20000u);
+        let b3: u32 = load_plane_byte(addr + 0x30000u);
+
+        let bit_index: u32 = 7u - (pixel_addr & 7u);
+        var shift_val: u32 = 0u;
+
+        switch params.shift_mode {
+            case 0u: {
+                shift_val = (((b0 >> bit_index) & 1u) |
+                            (((b1 >> bit_index) & 1u) << 1u) |
+                            (((b2 >> bit_index) & 1u) << 2u) |
+                            (((b3 >> bit_index) & 1u) << 3u));
+            }
+            case 0x20u: {
+                // Packed shift mode
+                let idx_in_byte: u32 = pixel_addr & 7u;
+                var packed: u32 = 0u;
+                switch idx_in_byte {
+                    case 0u: { packed = ((b0 >> 6u) & 0x3u) | ((b2 >> 4u) & 0xCu); }
+                    case 1u: { packed = ((b0 >> 4u) & 0x3u) | ((b2 >> 2u) & 0xCu); }
+                    case 2u: { packed = ((b0 >> 2u) & 0x3u) | ((b2 >> 0u) & 0xCu); }
+                    case 3u: { packed = ((b0 >> 0u) & 0x3u) | ((b2 << 2u) & 0xCu); }
+                    case 4u: { packed = ((b1 >> 6u) & 0x3u) | ((b3 >> 4u) & 0xCu); }
+                    case 5u: { packed = ((b1 >> 4u) & 0x3u) | ((b3 >> 2u) & 0xCu); }
+                    case 6u: { packed = ((b1 >> 2u) & 0x3u) | ((b3 >> 0u) & 0xCu); }
+                    default: { packed = ((b1 >> 0u) & 0x3u) | ((b3 << 2u) & 0xCu); }
+                }
+                shift_val = packed;
+            }
+            default: {
+                // 256-color shift mode (0x40 or 0x60)
+                let idx_in_byte: u32 = pixel_addr & 7u;
+                var packed: u32 = 0u;
+                switch idx_in_byte {
+                    case 0u: { packed = (b0 >> 4u) & 0xFu; }
+                    case 1u: { packed = b0 & 0xFu; }
+                    case 2u: { packed = (b1 >> 4u) & 0xFu; }
+                    case 3u: { packed = b1 & 0xFu; }
+                    case 4u: { packed = (b2 >> 4u) & 0xFu; }
+                    case 5u: { packed = b2 & 0xFu; }
+                    case 6u: { packed = (b3 >> 4u) & 0xFu; }
+                    default: { packed = b3 & 0xFu; }
+                }
+                shift_val = packed;
+            }
+        }
+
+        if(params.pel_width != 0u) {
+            // Combine pairs like CPU pel width path
+            let idx_in_group: u32 = (pixel_addr & 3u) * 2u;
+            var pair_val: u32 = 0u;
+            let neighbor_pixel: u32 = (pixel_addr & ~3u) | ((pixel_addr & 3u) * 2u + 1u);
+            let n_idx_in_byte: u32 = neighbor_pixel & 7u;
+            var neighbor_shift: u32 = 0u;
+
+            switch params.shift_mode {
+                case 0u: {
+                    let n_bit: u32 = 7u - n_idx_in_byte;
+                    neighbor_shift = (((b0 >> n_bit) & 1u) |
+                                      (((b1 >> n_bit) & 1u) << 1u) |
+                                      (((b2 >> n_bit) & 1u) << 2u) |
+                                      (((b3 >> n_bit) & 1u) << 3u));
+                }
+                case 0x20u: {
+                    switch n_idx_in_byte {
+                        case 0u: { neighbor_shift = ((b0 >> 6u) & 0x3u) | ((b2 >> 4u) & 0xCu); }
+                        case 1u: { neighbor_shift = ((b0 >> 4u) & 0x3u) | ((b2 >> 2u) & 0xCu); }
+                        case 2u: { neighbor_shift = ((b0 >> 2u) & 0x3u) | ((b2 >> 0u) & 0xCu); }
+                        case 3u: { neighbor_shift = ((b0 >> 0u) & 0x3u) | ((b2 << 2u) & 0xCu); }
+                        case 4u: { neighbor_shift = ((b1 >> 6u) & 0x3u) | ((b3 >> 4u) & 0xCu); }
+                        case 5u: { neighbor_shift = ((b1 >> 4u) & 0x3u) | ((b3 >> 2u) & 0xCu); }
+                        case 6u: { neighbor_shift = ((b1 >> 2u) & 0x3u) | ((b3 >> 0u) & 0xCu); }
+                        default: { neighbor_shift = ((b1 >> 0u) & 0x3u) | ((b3 << 2u) & 0xCu); }
+                    }
+                }
+                default: {
+                    switch n_idx_in_byte {
+                        case 0u: { neighbor_shift = (b0 >> 4u) & 0xFu; }
+                        case 1u: { neighbor_shift = b0 & 0xFu; }
+                        case 2u: { neighbor_shift = (b1 >> 4u) & 0xFu; }
+                        case 3u: { neighbor_shift = b1 & 0xFu; }
+                        case 4u: { neighbor_shift = (b2 >> 4u) & 0xFu; }
+                        case 5u: { neighbor_shift = b2 & 0xFu; }
+                        case 6u: { neighbor_shift = (b3 >> 4u) & 0xFu; }
+                        default: { neighbor_shift = b3 & 0xFu; }
+                    }
+                }
+            }
+
+            pair_val = (shift_val << 4u) | (neighbor_shift & 0xFu);
+            return pair_val & 0xFFu;
+        }
+
+        return shift_val & 0xFFu;
+    }
+
+    fn rgb_from_15(word: u32) -> vec4<f32> {
+        let r = f32(word & 0x1Fu) * (1.0 / 31.0);
+        let g = f32((word >> 5u) & 0x1Fu) * (1.0 / 31.0);
+        let b = f32((word >> 10u) & 0x1Fu) * (1.0 / 31.0);
+        return vec4<f32>(r, g, b, 1.0);
+    }
+
+    fn rgb_from_16(word: u32) -> vec4<f32> {
+        let r = f32(word & 0x1Fu) * (1.0 / 31.0);
+        let g = f32((word >> 5u) & 0x3Fu) * (1.0 / 63.0);
+        let b = f32((word >> 11u) & 0x1Fu) * (1.0 / 31.0);
+        return vec4<f32>(r, g, b, 1.0);
+    }
+
+    @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        if(gid.x >= params.width || gid.y >= params.height) {
+            return;
+        }
+
+        let idx: u32 = gid.y * params.width + gid.x;
+
+        // Modes:
+        // 0 - VGA planar (compute index from planes)
+        // 1 - VGA 4bpp (palette via dac_map)
+        // 2 - VGA 8bpp (palette direct)
+        // 3 - SVGA 8bpp (palette direct)
+        // 4 - SVGA 15bpp (RGB555)
+        // 5 - SVGA 16bpp (RGB565)
+        // 6 - SVGA 24bpp (BGR888 packed into u32)
+        // 7 - SVGA 32bpp (BGRX8888)
+        var rgba: vec4<f32>;
+
+        switch params.mode {
+            case ${MODE_VGA_PLANAR}u: {
+                let raw: u32 = vga_planar_color(idx, params.width);
+                let color16: u32 = raw & params.color_plane_enable;
+                let color_index: u32 = (dac_map[color16] & params.mask) | params.colorset;
+                rgba = decode_palette(palette[color_index]);
+            }
+            case ${MODE_SVGA_15BPP}u: {
+                let w: u32 = pixel_indices[idx] & 0xFFFFu;
+                rgba = rgb_from_15(w);
+            }
+            case ${MODE_SVGA_16BPP}u: {
+                let w: u32 = pixel_indices[idx] & 0xFFFFu;
+                rgba = rgb_from_16(w);
+            }
+            case ${MODE_SVGA_24BPP}u, ${MODE_SVGA_32BPP}u: {
+                let packed: u32 = pixel_indices[idx];
+                let r = f32((packed >> 16u) & 0xFFu) / 255.0;
+                let g = f32((packed >> 8u) & 0xFFu) / 255.0;
+                let b = f32(packed & 0xFFu) / 255.0;
+                rgba = vec4<f32>(r, g, b, 1.0);
+            }
+            case ${MODE_VGA_8BPP}u, ${MODE_SVGA_8BPP}u: {
+                let raw: u32 = pixel_indices[idx] & 0xFFu;
+                let color_index: u32 = (raw & params.mask) | params.colorset;
+                rgba = decode_palette(palette[color_index]);
+            }
+            case ${MODE_VGA_4BPP}u: {
+                let raw: u32 = pixel_indices[idx] & 0xFFu;
+                let color16: u32 = raw & params.color_plane_enable;
+                let color_index: u32 = (dac_map[color16] & params.mask) | params.colorset;
+                rgba = decode_palette(palette[color_index]);
+            }
+            default: {
+                rgba = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+            }
+        }
+
+        textureStore(out_image, vec2<i32>(i32(gid.x), i32(gid.y)), rgba);
+    }
+    `,
+            });
+
+        bind_group_layout = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+                { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: canvas_format, viewDimension: "2d" } },
+                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+            ],
+        });
+
+        compute_pipeline = device.createComputePipeline({
+            layout: device.createPipelineLayout({ bindGroupLayouts: [bind_group_layout] }),
+            compute: { module: shader_module, entryPoint: "main" },
+        });
+    });
+
+    function ensure_buffer(current, size, usage, label)
+    {
+        if(!current || current.size < size)
+        {
+            return device.createBuffer({ size: Math.max(size, 1024), usage, label });
+        }
+        return current;
+    }
+
+    function ensure_frame_texture(width, height)
+    {
+        if(frame_texture && frame_texture_size.width === width && frame_texture_size.height === height)
+        {
+            return;
+        }
+        frame_texture_size = { width, height };
+        frame_texture = device.createTexture({
+            size: { width, height },
+            format: canvas_format,
+            usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.STORAGE_BINDING,
+        });
+    }
+
+    function number_as_color(n)
+    {
+        n = n.toString(16);
+        return "#" + "0".repeat(6 - n.length) + n;
+    }
+
+    function elem_set_scale(elem, sx, sy, use_scale)
+    {
+        if(!sx || !sy)
+        {
+            return;
+        }
+
+        elem.style.width = "";
+        elem.style.height = "";
+
+        if(use_scale)
+        {
+            elem.style.transform = "";
+        }
+
+        const rectangle = elem.getBoundingClientRect();
+
+        if(use_scale)
+        {
+            let scale_str = "";
+            scale_str += sx === 1 ? "" : " scaleX(" + sx + ")";
+            scale_str += sy === 1 ? "" : " scaleY(" + sy + ")";
+            elem.style.transform = scale_str;
+        }
+        else
+        {
+            if(sx % 1 === 0 && sy % 1 === 0)
+            {
+                graphic_screen.style["imageRendering"] = "crisp-edges";
+                graphic_screen.style["imageRendering"] = "pixelated";
+                graphic_screen.style["-ms-interpolation-mode"] = "nearest-neighbor";
+            }
+            else
+            {
+                graphic_screen.style["imageRendering"] = "";
+                graphic_screen.style["-ms-interpolation-mode"] = "";
+            }
+
+            const device_pixel_ratio = window.devicePixelRatio || 1;
+            if(device_pixel_ratio % 1 !== 0)
+            {
+                sx /= device_pixel_ratio;
+                sy /= device_pixel_ratio;
+            }
+        }
+
+        if(sx !== 1)
+        {
+            elem.style.width = rectangle.width * sx + "px";
+        }
+        if(sy !== 1)
+        {
+            elem.style.height = rectangle.height * sy + "px";
+        }
+    }
+
+    function update_scale_text()
+    {
+        elem_set_scale(text_screen, scale_x, scale_y, true);
+    }
+
+    function update_scale_graphic()
+    {
+        elem_set_scale(graphic_screen, scale_x * base_scale, scale_y * base_scale, false);
+    }
+
+    this.set_scale = function(sx, sy)
+    {
+        scale_x = sx;
+        scale_y = sy;
+        update_scale_text();
+        update_scale_graphic();
+    };
+
+    this.set_size_graphical = function(width, height, buffer_width, buffer_height)
+    {
+        graphic_screen.width = width;
+        graphic_screen.height = height;
+
+        if(width <= 640 && width * 2 < window.innerWidth * window.devicePixelRatio &&
+            height * 2 < window.innerHeight * window.devicePixelRatio)
+        {
+            base_scale = 2;
+        }
+        else
+        {
+            base_scale = 1;
+        }
+
+        update_scale_graphic();
+
+        if(device)
+        {
+            canvas_context.configure({
+                device,
+                format: canvas_format,
+                alphaMode: "opaque",
+                usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+            });
+        }
+    };
+
+    this.set_size_text = function(cols, rows)
+    {
+        if(cols === text_mode_width && rows === text_mode_height)
+        {
+            return;
+        }
+
+        changed_rows = new Int8Array(rows);
+        text_mode_data = new Int32Array(cols * rows * TEXT_BUF_COMPONENT_SIZE);
+
+        text_mode_width = cols;
+        text_mode_height = rows;
+
+        if(mode === MODE_TEXT)
+        {
+            while(text_screen.childNodes.length > rows)
+            {
+                text_screen.removeChild(text_screen.firstChild);
+            }
+
+            while(text_screen.childNodes.length < rows)
+            {
+                text_screen.appendChild(document.createElement("div"));
+            }
+
+            for(let i = 0; i < rows; i++)
+            {
+                this.text_update_row(i);
+            }
+
+            update_scale_text();
+        }
+    };
+
+    this.set_mode = function(graphical)
+    {
+        mode = graphical ? MODE_GRAPHICAL : MODE_TEXT;
+        if(mode === MODE_TEXT)
+        {
+            text_screen.style.display = "block";
+            graphic_screen.style.display = "none";
+        }
+        else
+        {
+            text_screen.style.display = "none";
+            graphic_screen.style.display = "block";
+        }
+    };
+
+    this.set_font_bitmap = function(height, width_9px, width_dbl, copy_8th_col, vga_bitmap, vga_bitmap_changed)
+    {
+        const width = width_dbl ? 16 : (width_9px ? 9 : 8);
+        const size_changed = font_width !== width || font_height !== height;
+        font_height = height;
+        font_width = width;
+        font_width_9px = width_9px;
+        font_width_dbl = width_dbl;
+        font_copy_8th_col = copy_8th_col;
+        if(size_changed && changed_rows)
+        {
+            changed_rows.fill(1);
+        }
+    };
+
+    this.set_font_page = function(page_a, page_b)
+    {
+        if(font_page_a !== page_a || font_page_b !== page_b)
+        {
+            font_page_a = page_a;
+            font_page_b = page_b;
+            if(changed_rows)
+            {
+                changed_rows.fill(1);
+            }
+        }
+    };
+
+    this.put_char = function(row, col, chr, flags, bg_color, fg_color)
+    {
+        const p = TEXT_BUF_COMPONENT_SIZE * (row * text_mode_width + col);
+        text_mode_data[p + CHARACTER_INDEX] = chr;
+        text_mode_data[p + FLAGS_INDEX] = flags;
+        text_mode_data[p + BG_COLOR_INDEX] = bg_color;
+        text_mode_data[p + FG_COLOR_INDEX] = fg_color;
+        changed_rows[row] = 1;
+    };
+
+    this.update_cursor_scanline = function(start, end, enabled)
+    {
+        if(start !== cursor_start || end !== cursor_end || enabled !== cursor_enabled)
+        {
+            if(mode === MODE_TEXT)
+            {
+                if(enabled)
+                {
+                    cursor_element.style.display = "inline";
+                    cursor_element.style.height = (end - start) + "px";
+                    cursor_element.style.marginTop = start + "px";
+                }
+                else
+                {
+                    cursor_element.style.display = "none";
+                }
+            }
+
+            cursor_start = start;
+            cursor_end = end;
+            cursor_enabled = enabled;
+        }
+    };
+
+    this.update_cursor = function(row, col)
+    {
+        if(row !== cursor_row || col !== cursor_col)
+        {
+            if(row < text_mode_height)
+            {
+                changed_rows[row] = 1;
+            }
+            if(cursor_row < text_mode_height)
+            {
+                changed_rows[cursor_row] = 1;
+            }
+
+            cursor_row = row;
+            cursor_col = col;
+        }
+    };
+
+    this.text_update_row = function(row)
+    {
+        let offset = TEXT_BUF_COMPONENT_SIZE * row * text_mode_width;
+        let row_element,
+            color_element,
+            fragment;
+
+        let blinking,
+            bg_color,
+            fg_color,
+            text;
+
+        row_element = text_screen.childNodes[row];
+        fragment = document.createElement("div");
+
+        for(let i = 0; i < text_mode_width; )
+        {
+            color_element = document.createElement("span");
+
+            blinking = text_mode_data[offset + FLAGS_INDEX] & FLAG_BLINKING;
+            bg_color = text_mode_data[offset + BG_COLOR_INDEX];
+            fg_color = text_mode_data[offset + FG_COLOR_INDEX];
+
+            if(blinking)
+            {
+                color_element.classList.add("blink");
+            }
+
+            color_element.style.backgroundColor = number_as_color(bg_color);
+            color_element.style.color = number_as_color(fg_color);
+
+            text = "";
+
+            while(i < text_mode_width &&
+                (text_mode_data[offset + FLAGS_INDEX] & FLAG_BLINKING) === blinking &&
+                text_mode_data[offset + BG_COLOR_INDEX] === bg_color &&
+                text_mode_data[offset + FG_COLOR_INDEX] === fg_color)
+            {
+                const chr = charmap[text_mode_data[offset + CHARACTER_INDEX]];
+
+                text += chr;
+
+                i++;
+                offset += TEXT_BUF_COMPONENT_SIZE;
+
+                if(row === cursor_row)
+                {
+                    if(i === cursor_col)
+                    {
+                        // next row will be cursor
+                        // create new element
+                        break;
+                    }
+                    else if(i === cursor_col + 1)
+                    {
+                        // found the cursor
+                        cursor_element.style.backgroundColor = color_element.style.color;
+                        fragment.appendChild(cursor_element);
+                        break;
+                    }
+                }
+            }
+
+            color_element.textContent = text;
+            fragment.appendChild(color_element);
+        }
+
+        row_element.parentNode.replaceChild(fragment, row_element);
+    };
+
+    this.update_text = function()
+    {
+        for(let i = 0; i < text_mode_height; i++)
+        {
+            if(changed_rows[i])
+            {
+                this.text_update_row(i);
+                changed_rows[i] = 0;
+            }
+        }
+    };
+
+    this.update_graphical = function()
+    {
+        this.screen_fill_buffer();
+    };
+
+    this.update_screen = function()
+    {
+        if(!text_mode_paused)
+        {
+            if(mode === MODE_TEXT)
+            {
+                this.update_text();
+            }
+            else
+            {
+                this.update_graphical();
+            }
+        }
+        this.timer();
+    };
+
+    this.timer = function()
+    {
+        text_timer_id = requestAnimationFrame(() => this.update_screen());
+    };
+
+    this.pause = function()
+    {
+        text_mode_paused = true;
+        cursor_element.classList.remove("blinking-cursor");
+    };
+
+    this.continue = function()
+    {
+        text_mode_paused = false;
+        cursor_element.classList.add("blinking-cursor");
+    };
+
+    this.destroy = function()
+    {
+        if(text_timer_id)
+        {
+            cancelAnimationFrame(text_timer_id);
+            text_timer_id = 0;
+        }
+    };
+
+    this.clear_screen = function()
+    {
+        if(!device)
+        {
+            return;
+        }
+        const encoder = device.createCommandEncoder();
+        const swap_texture = canvas_context.getCurrentTexture();
+        const view = swap_texture.createView();
+        encoder.beginRenderPass({
+            colorAttachments: [{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
+        }).end();
+        device.queue.submit([encoder.finish()]);
+    };
+
+    this.update_buffer = function(layers)
+    {
+        // Fallback for callers that still pass CPU ImageData (e.g., SVGA path).
+        if(!device)
+        {
+            return;
+        }
+
+        const swap_texture = canvas_context.getCurrentTexture();
+        const encoder = device.createCommandEncoder();
+
+        for(const layer of layers)
+        {
+            const { image_data, screen_x, screen_y, buffer_x, buffer_y, buffer_width, buffer_height } = layer;
+            if(!image_data)
+            {
+                continue;
+            }
+
+            const temp_texture = device.createTexture({
+                size: { width: image_data.width, height: image_data.height },
+                format: canvas_format,
+                usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+            });
+
+            device.queue.writeTexture(
+                { texture: temp_texture },
+                image_data.data,
+                { bytesPerRow: image_data.width * 4 },
+                { width: image_data.width, height: image_data.height },
+            );
+
+            const src_origin = { x: buffer_x, y: buffer_y, z: 0 };
+            const dst_origin = { x: Math.max(0, screen_x), y: Math.max(0, screen_y), z: 0 };
+            const copy_width = Math.min(buffer_width, temp_texture.width - buffer_x, swap_texture.width - dst_origin.x);
+            const copy_height = Math.min(buffer_height, temp_texture.height - buffer_y, swap_texture.height - dst_origin.y);
+
+            if(copy_width > 0 && copy_height > 0)
+            {
+                encoder.copyTextureToTexture(
+                    { texture: temp_texture, origin: src_origin },
+                    { texture: swap_texture, origin: dst_origin },
+                    { width: copy_width, height: copy_height, depthOrArrayLayers: 1 },
+                );
+            }
+        }
+
+        device.queue.submit([encoder.finish()]);
+    };
+
+    this.update_buffer_webgpu = function(payload)
+    {
+        if(!device || !compute_pipeline)
+        {
+            return;
+        }
+
+        const texture_width = payload.texture_width;
+        const texture_height = payload.texture_height;
+
+        ensure_frame_texture(texture_width, texture_height);
+
+        const pixel_data = payload.pixel_buffer;
+        pixel_buffer_gpu = ensure_buffer(pixel_buffer_gpu, pixel_data.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-pixel-buffer");
+        queue.writeBuffer(pixel_buffer_gpu, 0, pixel_data);
+
+        palette_buffer_gpu = ensure_buffer(palette_buffer_gpu, payload.palette.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-palette-buffer");
+        queue.writeBuffer(palette_buffer_gpu, 0, payload.palette);
+
+        dac_map_buffer_gpu = ensure_buffer(dac_map_buffer_gpu, payload.dac_map.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-dac-map");
+        queue.writeBuffer(dac_map_buffer_gpu, 0, payload.dac_map);
+
+        if(payload.planes)
+        {
+            plane_buffer_gpu = ensure_buffer(plane_buffer_gpu, payload.planes.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "vga-planes");
+            queue.writeBuffer(plane_buffer_gpu, 0, payload.planes);
+        }
+        else
+        {
+            plane_buffer_gpu = null;
+        }
+
+        params_array[0] = texture_width;
+        params_array[1] = texture_height;
+        params_array[2] = payload.mask >>> 0;
+        params_array[3] = payload.colorset >>> 0;
+        params_array[4] = payload.mode;
+        params_array[5] = payload.color_plane_enable >>> 0;
+        params_array[6] = payload.addr_shift >>> 0;
+        params_array[7] = payload.addr_substitution >>> 0;
+        params_array[8] = payload.shift_mode >>> 0;
+        params_array[9] = payload.pel_width >>> 0;
+        params_array[10] = payload.start_address >>> 0;
+
+        params_buffer_gpu = ensure_buffer(params_buffer_gpu, params_array.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, "vga-params");
+        queue.writeBuffer(params_buffer_gpu, 0, params_array);
+
+        const bind_group = device.createBindGroup({
+            layout: bind_group_layout,
+            entries: [
+                { binding: 0, resource: { buffer: pixel_buffer_gpu } },
+                { binding: 1, resource: { buffer: palette_buffer_gpu } },
+                { binding: 2, resource: { buffer: dac_map_buffer_gpu } },
+                { binding: 3, resource: { buffer: plane_buffer_gpu ?? pixel_buffer_gpu } },
+                { binding: 4, resource: frame_texture.createView() },
+                { binding: 5, resource: { buffer: params_buffer_gpu } },
+            ],
+        });
+
+        const encoder = device.createCommandEncoder();
+        const compute = encoder.beginComputePass();
+        compute.setPipeline(compute_pipeline);
+        compute.setBindGroup(0, bind_group);
+        const workgroups_x = Math.ceil(texture_width / WORKGROUP_SIZE);
+        const workgroups_y = Math.ceil(texture_height / WORKGROUP_SIZE);
+        compute.dispatchWorkgroups(workgroups_x, workgroups_y);
+        compute.end();
+
+        const swap_texture = canvas_context.getCurrentTexture();
+
+        for(const layer of payload.layers)
+        {
+            let src_x = layer.buffer_x;
+            let src_y = layer.buffer_y;
+            let dst_x = layer.screen_x;
+            let dst_y = layer.screen_y;
+            let copy_width = layer.buffer_width;
+            let copy_height = layer.buffer_height;
+
+            if(dst_x < 0)
+            {
+                const delta = -dst_x;
+                src_x += delta;
+                copy_width -= delta;
+                dst_x = 0;
+            }
+            if(dst_y < 0)
+            {
+                const delta = -dst_y;
+                src_y += delta;
+                copy_height -= delta;
+                dst_y = 0;
+            }
+
+            copy_width = Math.min(copy_width, swap_texture.width - dst_x, frame_texture_size.width - src_x);
+            copy_height = Math.min(copy_height, swap_texture.height - dst_y, frame_texture_size.height - src_y);
+
+            if(copy_width <= 0 || copy_height <= 0)
+            {
+                continue;
+            }
+
+            encoder.copyTextureToTexture(
+                { texture: frame_texture, origin: { x: src_x, y: src_y, z: 0 } },
+                { texture: swap_texture, origin: { x: dst_x, y: dst_y, z: 0 } },
+                { width: copy_width, height: copy_height, depthOrArrayLayers: 1 },
+            );
+        }
+
+        device.queue.submit([encoder.finish()]);
+    };
+
+    this.get_text_screen = function()
+    {
+        const screen = [];
+        for(let i = 0; i < text_mode_height; i++)
+        {
+            screen.push(this.get_text_row(i));
+        }
+        return screen;
+    };
+
+    this.get_text_row = function(y)
+    {
+        const begin = y * text_mode_width * TEXT_BUF_COMPONENT_SIZE + CHARACTER_INDEX;
+        const end = begin + text_mode_width * TEXT_BUF_COMPONENT_SIZE;
+        let row = "";
+        for(let i = begin; i < end; i += TEXT_BUF_COMPONENT_SIZE)
+        {
+            row += charmap[text_mode_data[i]];
+        }
+        return row;
+    };
+
+    this.screen_fill_buffer = screen_fill_buffer;
+
+    this.init = function()
+    {
+        cursor_element.classList.add("cursor");
+        cursor_element.style.position = "absolute";
+        cursor_element.style.backgroundColor = "#ccc";
+        cursor_element.style.width = "7px";
+        cursor_element.style.display = "inline-block";
+        cursor_element.classList.add("blinking-cursor");
+
+        this.set_mode(false);
+        this.set_size_text(80, 25);
+        this.set_scale(scale_x, scale_y);
+
+        this.timer();
+    };
+
+    init_promise.then(() => this.init());
 }

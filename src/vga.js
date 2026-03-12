@@ -379,6 +379,10 @@ export function VGAScreen(cpu, bus, screen, vga_memory_size)
     this.plane2 = new Uint8Array(this.vga_memory.buffer, 2 * VGA_BANK_SIZE, VGA_BANK_SIZE);
     this.plane3 = new Uint8Array(this.vga_memory.buffer, 3 * VGA_BANK_SIZE, VGA_BANK_SIZE);
     this.pixel_buffer = new Uint8Array(VGA_PIXEL_BUFFER_SIZE);
+    this.webgpu_pixel_u32 = new Uint32Array(VGA_PIXEL_BUFFER_SIZE);
+    this.webgpu_palette_u32 = new Uint32Array(256);
+    this.webgpu_dac_map_u32 = new Uint32Array(0x10);
+    this.webgpu_planes_u8 = new Uint8Array(4 * VGA_BANK_SIZE);
 
     io.mmap_register(0xA0000, 0x20000,
         addr => this.vga_memory_read(addr),
@@ -463,35 +467,33 @@ VGAScreen.prototype.get_state = function()
 
 VGAScreen.prototype.set_state = function(state)
 {
-    this.vga_memory_size = state[0];
-    this.cursor_address = state[1];
-    this.cursor_scanline_start = state[2];
-    this.cursor_scanline_end = state[3];
-    this.max_cols = state[4];
-    this.max_rows = state[5];
-    state[6] && this.vga_memory.set(state[6]);
-    this.dac_state = state[7];
-    this.start_address = state[8];
-    this.graphical_mode = state[9];
-    this.vga256_palette = state[10];
-    this.latch_dword = state[11];
-    this.color_compare = state[12];
-    this.color_dont_care = state[13];
-    this.miscellaneous_graphics_register = state[14];
-    this.svga_width = state[15];
-    this.svga_height = state[16];
-    this.crtc_mode = state[17];
-    this.svga_enabled = state[18];
-    this.svga_bpp = state[19];
-    this.svga_bank_offset = state[20];
-    this.svga_offset = state[21];
-    this.index_crtc = state[22];
-    this.dac_color_index_write = state[23];
-    this.dac_color_index_read = state[24];
-    this.dac_map = state[25];
-    this.sequencer_index = state[26];
-    this.plane_write_bm = state[27];
-    this.sequencer_memory_mode = state[28];
+    const mask_colorset = this.attribute_mode & 0x80 ? 0xCF : 0xFF;
+    let mask = mask_colorset;
+    let colorset = 0x00;
+
+    if(this.attribute_mode & 0x80)
+    {
+        colorset |= this.color_select << 4 & 0x30;
+    }
+
+    let mode;
+    if(this.attribute_mode & 0x40)
+    {
+        mode = 2; // MODE_VGA_8BPP
+    }
+    else
+    {
+        mask &= 0x3F;
+        colorset |= this.color_select << 4 & 0xC0;
+        mode = 1; // MODE_VGA_4BPP
+    }
+
+    const pixel_count = this.virtual_width * this.virtual_height;
+    if(this.webgpu_pixel_u32.length < pixel_count)
+    {
+        this.webgpu_pixel_u32 = new Uint32Array(pixel_count);
+    }
+    this.webgpu_pixel_u32.set(this.pixel_buffer.subarray(0, pixel_count));
     this.graphics_index = state[29];
     this.plane_read = state[30];
     this.planar_mode = state[31];
@@ -2470,6 +2472,193 @@ VGAScreen.prototype.vga_redraw = function()
     }
 };
 
+VGAScreen.prototype.webgpu_payload = function()
+{
+    const mask_colorset = this.attribute_mode & 0x80 ? 0xCF : 0xFF;
+    let mask = mask_colorset;
+    let colorset = 0x00;
+
+    if(this.attribute_mode & 0x80)
+    {
+        colorset |= this.color_select << 4 & 0x30;
+    }
+
+    let mode;
+    if(this.attribute_mode & 0x40)
+    {
+        // 8-bit mode
+        mode = 1; // MODE_VGA_8BPP
+    }
+    else
+    {
+        // 4-bit mode
+        mask &= 0x3F;
+        colorset |= this.color_select << 4 & 0xC0;
+        mode = 0; // MODE_VGA_4BPP
+    }
+
+    const pixel_count = this.virtual_width * this.virtual_height;
+    if(this.webgpu_pixel_u32.length < pixel_count)
+    {
+        this.webgpu_pixel_u32 = new Uint32Array(pixel_count);
+    }
+    this.webgpu_pixel_u32.set(this.pixel_buffer.subarray(0, pixel_count));
+    this.webgpu_palette_u32.set(this.vga256_palette);
+    for(let i = 0; i < this.dac_map.length; i++)
+    {
+        this.webgpu_dac_map_u32[i] = this.dac_map[i];
+    }
+
+    return {
+        pixel_buffer: this.webgpu_pixel_u32.subarray(0, pixel_count),
+        palette: this.webgpu_palette_u32,
+        dac_map: this.webgpu_dac_map_u32,
+        mask,
+        colorset,
+        mode,
+        color_plane_enable: this.color_plane_enable,
+        texture_width: this.virtual_width,
+        texture_height: this.virtual_height,
+        layers: this.layers,
+    };
+};
+
+VGAScreen.prototype.webgpu_payload_svga = function()
+{
+    const pixel_count = this.svga_width * this.svga_height;
+    if(this.webgpu_pixel_u32.length < pixel_count)
+    {
+        this.webgpu_pixel_u32 = new Uint32Array(pixel_count);
+    }
+
+    let mode;
+    const bytes_per_pixel = this.svga_bpp === 15 ? 2 : this.svga_bpp / 8;
+    const base_byte_offset = this.svga_memory.byteOffset + (this.svga_offset * bytes_per_pixel);
+
+    if(this.svga_bpp === 8)
+    {
+        // Copy raw color indices; palette lookup happens in shader.
+        const svga_memory = new Uint8Array(this.cpu.wasm_memory.buffer, base_byte_offset, pixel_count);
+        this.webgpu_pixel_u32.set(svga_memory);
+        mode = 3; // MODE_SVGA_8BPP
+        this.webgpu_palette_u32.set(this.vga256_palette);
+    }
+    else if(this.svga_bpp === 15)
+    {
+        const src = new Uint16Array(this.cpu.wasm_memory.buffer, base_byte_offset, pixel_count);
+        for(let i = 0; i < pixel_count; i++)
+        {
+            this.webgpu_pixel_u32[i] = src[i] & 0xFFFF;
+        }
+        mode = 4; // MODE_SVGA_15BPP
+    }
+    else if(this.svga_bpp === 16)
+    {
+        const src = new Uint16Array(this.cpu.wasm_memory.buffer, base_byte_offset, pixel_count);
+        for(let i = 0; i < pixel_count; i++)
+        {
+            this.webgpu_pixel_u32[i] = src[i] & 0xFFFF;
+        }
+        mode = 5; // MODE_SVGA_16BPP
+    }
+    else if(this.svga_bpp === 24)
+    {
+        const src = new Uint8Array(this.cpu.wasm_memory.buffer, base_byte_offset, pixel_count * 3);
+        for(let i = 0, j = 0; i < pixel_count; i++, j += 3)
+        {
+            const b0 = src[j];
+            const b1 = src[j + 1];
+            const b2 = src[j + 2];
+            this.webgpu_pixel_u32[i] = (b2 << 16) | (b1 << 8) | b0;
+        }
+        mode = 6; // MODE_SVGA_24BPP
+    }
+    else
+    {
+        // 32 bpp: Assume BGRX little endian
+        const src = new Uint32Array(this.cpu.wasm_memory.buffer, base_byte_offset, pixel_count);
+        this.webgpu_pixel_u32.set(src.subarray(0, pixel_count));
+        mode = 7; // MODE_SVGA_32BPP
+    }
+
+    return {
+        pixel_buffer: this.webgpu_pixel_u32.subarray(0, pixel_count),
+        palette: this.webgpu_palette_u32,
+        dac_map: this.webgpu_dac_map_u32,
+        mask: 0,
+        colorset: 0,
+        mode,
+        color_plane_enable: this.color_plane_enable,
+        texture_width: this.svga_width,
+        texture_height: this.svga_height,
+        layers: [{
+            image_data: null,
+            screen_x: 0, screen_y: 0,
+            buffer_x: 0, buffer_y: 0,
+            buffer_width: this.svga_width,
+            buffer_height: this.svga_height,
+        }],
+    };
+};
+
+VGAScreen.prototype.webgpu_payload_vga_planar = function()
+{
+    const mask_colorset = this.attribute_mode & 0x80 ? 0xCF : 0xFF;
+    let mask = mask_colorset;
+    let colorset = 0x00;
+
+    if(this.attribute_mode & 0x80)
+    {
+        colorset |= this.color_select << 4 & 0x30;
+    }
+
+    // 4bpp path tightens mask and colorset
+    if(!(this.attribute_mode & 0x40))
+    {
+        mask &= 0x3F;
+        colorset |= this.color_select << 4 & 0xC0;
+    }
+
+    const pixel_count = this.virtual_width * this.virtual_height;
+    if(this.webgpu_pixel_u32.length < pixel_count)
+    {
+        this.webgpu_pixel_u32 = new Uint32Array(pixel_count);
+    }
+
+    // Keep pixel buffer populated for compatibility even though planar mode uses plane data.
+    this.webgpu_pixel_u32.set(this.pixel_buffer.subarray(0, pixel_count));
+    this.webgpu_palette_u32.set(this.vga256_palette);
+    for(let i = 0; i < this.dac_map.length; i++)
+    {
+        this.webgpu_dac_map_u32[i] = this.dac_map[i];
+    }
+
+    // Pack planes linearly so the shader can index with 64K strides.
+    this.webgpu_planes_u8.set(this.plane0, 0 * VGA_BANK_SIZE);
+    this.webgpu_planes_u8.set(this.plane1, 1 * VGA_BANK_SIZE);
+    this.webgpu_planes_u8.set(this.plane2, 2 * VGA_BANK_SIZE);
+    this.webgpu_planes_u8.set(this.plane3, 3 * VGA_BANK_SIZE);
+
+    return {
+        pixel_buffer: this.webgpu_pixel_u32.subarray(0, pixel_count),
+        palette: this.webgpu_palette_u32,
+        dac_map: this.webgpu_dac_map_u32,
+        planes: this.webgpu_planes_u8,
+        mask,
+        colorset,
+        mode: 0, // MODE_VGA_PLANAR
+        color_plane_enable: this.color_plane_enable,
+        texture_width: this.virtual_width,
+        texture_height: this.virtual_height,
+        addr_shift: this.vga_addr_shift_count(),
+        addr_substitution: ~this.crtc_mode & 0x3,
+        shift_mode: this.planar_mode & 0x60,
+        pel_width: this.attribute_mode & 0x40 ? 1 : 0,
+        start_address: this.start_address_latched,
+        layers: this.layers,
+    };
+};
+
 VGAScreen.prototype.screen_fill_buffer = function()
 {
     if(!this.graphical_mode)
@@ -2488,6 +2677,8 @@ VGAScreen.prototype.screen_fill_buffer = function()
         this.image_data = new ImageData(buffer, this.virtual_width, this.virtual_height);
         this.update_layers();
     }
+
+    const use_webgpu = this.screen && this.screen.use_webgpu && typeof this.screen.update_buffer_webgpu === "function";
 
     if(this.svga_enabled)
     {
@@ -2521,20 +2712,35 @@ VGAScreen.prototype.screen_fill_buffer = function()
             min_y = Math.max(min_y, 0);
             max_y = Math.min(max_y, this.svga_height);
 
-            this.screen.update_buffer([{
-                image_data: this.image_data,
-                screen_x: 0, screen_y: min_y,
-                buffer_x: 0, buffer_y: min_y,
-                buffer_width: this.svga_width,
-                buffer_height: max_y - min_y,
-            }]);
+            if(use_webgpu)
+            {
+                this.screen.update_buffer_webgpu(this.webgpu_payload_svga());
+            }
+            else
+            {
+                this.screen.update_buffer([{
+                    image_data: this.image_data,
+                    screen_x: 0, screen_y: min_y,
+                    buffer_x: 0, buffer_y: min_y,
+                    buffer_width: this.svga_width,
+                    buffer_height: max_y - min_y,
+                }]);
+            }
         }
     }
     else
     {
-        this.vga_replot();
-        this.vga_redraw();
-        this.screen.update_buffer(this.layers);
+        if(use_webgpu)
+        {
+            // GPU handles planar unpack + palette
+            this.screen.update_buffer_webgpu(this.webgpu_payload_vga_planar());
+        }
+        else
+        {
+            this.vga_replot();
+            this.vga_redraw();
+            this.screen.update_buffer(this.layers);
+        }
     }
 
     this.reset_diffs();
