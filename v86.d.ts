@@ -7,7 +7,7 @@
  * `async` defaults to false, but this is subject to change. If true, the file
  * is downloaded completely, otherwise in chunks (see below for the chunking
  * method). BIOS, multiboot, bzimage and state files are always downloaded
- * completely, as they’re required before emulation can start.
+ * completely, as they're required before emulation can start.
  *
  * Files with `async: true` and `use_parts: false` are downloaded using HTTP
  * Range requests. Note that not all web servers support this header correctly,
@@ -34,6 +34,23 @@ export type V86Image =
       }
     //| { buffer: File; async?: boolean; }; // only in browsers: https://developer.mozilla.org/en-US/docs/Web/API/File
     | { buffer: ArrayBuffer };
+
+/**
+ * Console types:
+ * `textarea` - using TextArea HTML element, doesn't support ESC codes
+ * `xtermjs` - using XtermJS-compatible terminal
+ *
+ * `xterm_lib` - XtermJS constructor, useful for ESM users. When not set,
+ * `window["Terminal"]` is used
+ *
+ * `container` - HTML container for console
+ */
+export type ConsoleConfig =
+    {
+        type: "textarea" | "xtermjs" | "none";
+        xterm_lib?: Function;
+        container?: HTMLElement | HTMLTextAreaElement;
+    };
 
 export enum LogLevel {
     LOG_ALL = -1,
@@ -73,29 +90,28 @@ export enum BootOrder {
     HARDDISK_CD_FLOPPY = 0x132,
 }
 
-export enum Event {
-    FS_ATTACH = "9p-attach",
-    FS_READ_END = "9p-read-end",
-    FS_READ_START = "9p-read-start",
-    FS_WRITE_END = "9p-write-end",
-    DOWNLOAD_ERROR = "download-error",
-    DOWNLOAD_PROGRESS = "download-progress",
-    EMULATOR_LOADED = "emulator-loaded",
-    EMULATOR_READY = "emulator-ready",
-    EMULATOR_STARTED = "emulator-started",
-    EMULATOR_STOPPED = "emulator-stopped",
-    ETH_RECEIVE_END = "eth-receive-end",
-    ETH_TRANSMIT_END = "eth-transmit-end",
-    IDE_READ_END = "ide-read-end",
-    IDE_READ_START = "ide-read-start",
-    IDE_WRITE_END = "ide-write-end",
-    MOUSE_ENABLE = "mouse-enable",
-    NET0_SEND = "net0-send",
-    SCREEN_PUT_CHAR = "screen-put-char",
-    SCREEN_SET_SIZE = "screen-set-size",
-    SERIAL0_OUTPUT_BYTE = "serial0-output-byte",
-    VIRTIO_CONSOLE0_OUTPUT_BYTES = "virtio-console0-output-bytes",
-}
+export type Event =
+    | "9p-attach"
+    | "9p-read-end"
+    | "9p-read-start"
+    | "9p-write-end"
+    | "download-error"
+    | "download-progress"
+    | "emulator-loaded"
+    | "emulator-ready"
+    | "emulator-started"
+    | "emulator-stopped"
+    | "eth-receive-end"
+    | "eth-transmit-end"
+    | "ide-read-end"
+    | "ide-read-start"
+    | "ide-write-end"
+    | "mouse-enable"
+    | "net0-send"
+    | "screen-put-char"
+    | "screen-set-size"
+    | "serial0-output-byte"
+    | "virtio-console0-output-bytes";
 
 /**
  * emulator instance constructor options.
@@ -253,13 +269,26 @@ export interface V86Options {
     /**
      * A textarea that will receive and send data to the emulated serial terminal.
      * Alternatively the serial terminal can also be accessed programatically, see [serial.html](../examples/serial.html).
+     * Deprecated in favor of the serial_console config below
      */
     serial_container?: HTMLTextAreaElement;
 
     /**
      * Xtermjs serial terminal container. When set, serial_container option is ignored.
+     * Deprecated in favor of the serial_console config below
      */
     serial_container_xtermjs?: HTMLElement;
+
+    /**
+     * Console adapter for serial console
+     */
+    serial_console: ConsoleConfig;
+
+    /**
+     * Console adapter for virtio console.
+     * Setting to true, creates virtio console device without adapter
+     */
+    virtio_console: ConsoleConfig;
 
     /**
      * An HTMLElement. This should have a certain structure, see [basic.html](../examples/basic.html).
@@ -294,12 +323,6 @@ export interface V86Options {
      * @default false
      */
     virtio_balloon?: boolean;
-
-    /**
-     * create a virtio console device
-     * @default false
-     */
-    virtio_console?: boolean;
 
     /**
      * override the maximum supported cpuid level
