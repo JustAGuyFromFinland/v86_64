@@ -295,10 +295,7 @@ pub unsafe fn set_control_word(cw: u16) {
         1 => RoundingMode::Floor,
         2 => RoundingMode::Ceil,
         3 => RoundingMode::Trunc,
-        _ => {
-            dbg_assert!(false);
-            RoundingMode::NearEven
-        },
+        _ => RoundingMode::NearEven,
     });
 
     let precision_control = cw >> 8 & 3;
@@ -307,10 +304,7 @@ pub unsafe fn set_control_word(cw: u16) {
         1 => Precision::P80, // undefined
         2 => Precision::P64,
         3 => Precision::P80,
-        _ => {
-            dbg_assert!(false);
-            Precision::P80
-        },
+        _ => Precision::P80,
     });
 }
 

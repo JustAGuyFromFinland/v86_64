@@ -183,6 +183,7 @@ pub const CR4_PSE: i32 = 1 << 4;
 pub const CR4_DE: i32 = 1 << 3;
 pub const CR4_PAE: i32 = 1 << 5;
 pub const CR4_PGE: i32 = 1 << 7;
+pub const CR4_PCE: i32 = 1 << 8;
 pub const CR4_OSFXSR: i32 = 1 << 9;
 pub const CR4_OSXMMEXCPT: i32 = 1 << 10;
 pub const CR4_SMEP: i32 = 1 << 20;
@@ -2875,9 +2876,6 @@ pub unsafe fn get_seg(segment: i32) -> OrPageFault<i32> {
 pub unsafe fn set_cr0(cr0: i32) {
     let old_cr0 = *cr;
 
-    if old_cr0 & CR0_AM == 0 && cr0 & CR0_AM != 0 {
-        dbg_log!("Warning: Unimplemented: cr0 alignment mask");
-    }
     if (cr0 & (CR0_PE | CR0_PG)) == CR0_PG {
         trigger_gp(0);
         return;
@@ -4174,28 +4172,14 @@ pub unsafe fn task_switch_test() -> bool {
 pub unsafe fn set_mxcsr(new_mxcsr: i32) {
     dbg_assert!(new_mxcsr & !MXCSR_MASK == 0); // checked by caller
 
-    if *mxcsr & MXCSR_DAZ == 0 && new_mxcsr & MXCSR_DAZ != 0 {
-        dbg_log!("Warning: Unimplemented MXCSR bit: Denormals Are Zero");
-    }
-    if *mxcsr & MXCSR_FZ == 0 && new_mxcsr & MXCSR_FZ != 0 {
-        dbg_log!("Warning: Unimplemented MXCSR bit: Flush To Zero");
-    }
-
     let rounding_mode = new_mxcsr >> MXCSR_RC_SHIFT & 3;
-    if *mxcsr >> MXCSR_RC_SHIFT & 3 == 0 && rounding_mode != 0 {
-        dbg_log!(
-            "Warning: Unimplemented MXCSR rounding mode: {}",
-            rounding_mode
-        );
-    }
-
-    let exception_mask = new_mxcsr >> 7 & 0b111111;
-    if *mxcsr >> 7 & 0b111111 != exception_mask && exception_mask != 0b111111 {
-        dbg_log!(
-            "Warning: Unimplemented MXCSR exception mask: 0b{:b}",
-            exception_mask
-        );
-    }
+    softfloat::F80::set_rounding_mode(match rounding_mode {
+        0 => softfloat::RoundingMode::NearEven,
+        1 => softfloat::RoundingMode::Floor,
+        2 => softfloat::RoundingMode::Ceil,
+        3 => softfloat::RoundingMode::Trunc,
+        _ => softfloat::RoundingMode::NearEven,
+    });
 
     *mxcsr = new_mxcsr;
 }
@@ -4209,7 +4193,8 @@ pub unsafe fn task_switch_test_jit(eip_offset_in_page: i32) {
 
 pub unsafe fn task_switch_test_mmx() -> bool {
     if *cr.offset(4) & CR4_OSFXSR == 0 {
-        dbg_log!("Warning: Unimplemented task switch test with cr4.osfxsr=0");
+        trigger_ud();
+        return false;
     }
     if 0 != *cr & CR0_EM {
         trigger_ud();
@@ -4228,7 +4213,8 @@ pub unsafe fn task_switch_test_mmx() -> bool {
 pub unsafe fn task_switch_test_mmx_jit(eip_offset_in_page: i32) {
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     if *cr.offset(4) & CR4_OSFXSR == 0 {
-        dbg_log!("Warning: Unimplemented task switch test with cr4.osfxsr=0");
+        trigger_ud_jit(eip_offset_in_page);
+        return;
     }
     if 0 != *cr & CR0_EM {
         trigger_ud_jit(eip_offset_in_page);
@@ -4603,7 +4589,7 @@ pub fn io_port_write8(port: i32, value: i32) {
                     0xA1 => pic::portA1_write(value as u8),
                     0x4D0 => pic::port4D0_write(value as u8),
                     0x4D1 => pic::port4D1_write(value as u8),
-                    _ => dbg_assert!(false),
+                    _ => {},
                 };
                 handle_irqs()
             },

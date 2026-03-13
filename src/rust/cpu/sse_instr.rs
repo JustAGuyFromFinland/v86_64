@@ -278,10 +278,7 @@ pub unsafe fn sse_comparison(op: i32, x: f64, y: f64) -> bool {
         5 => return x >= y || x.is_nan() || y.is_nan(),
         6 => return x > y || x.is_nan() || y.is_nan(),
         7 => return !x.is_nan() && !y.is_nan(),
-        _ => {
-            dbg_assert!(false);
-            return false;
-        },
+        _ => return false,
     };
 }
 pub unsafe fn sse_min(x: f64, y: f64) -> f64 {

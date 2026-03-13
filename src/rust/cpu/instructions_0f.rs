@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
 
 unsafe fn undefined_instruction() {
     trigger_ud()
@@ -28,6 +29,30 @@ use crate::cpu::misc_instr::{
 use crate::cpu::misc_instr::{lar, lsl, verr, verw};
 use crate::cpu::misc_instr::{lss16, lss32};
 use crate::cpu::sse_instr::*;
+
+static mut msr_feat_ctl: u64 = 0;
+static mut msr_test_ctrl: u64 = 0;
+static mut msr_misc_feature_enables: u64 = 0;
+static mut msr_misc_enable: u64 = 1;
+static mut msr_mcg_cap: u64 = 0;
+static mut msr_kernel_gs_base: u64 = 0;
+static mut msr_perfevtsel0: u64 = 0;
+static mut msr_perfevtsel1: u64 = 0;
+static mut msr_pmc0: u64 = 0;
+static mut msr_pmc1: u64 = 0;
+static mut msr_pat: u64 = 0;
+static mut msr_spec_ctrl: u64 = 0;
+static mut msr_tsx_ctrl: u64 = 0;
+static mut msr_tsx_force_abort: u64 = 0;
+static mut msr_mcu_opt_ctrl: u64 = 0;
+static mut msr_amd64_ls_cfg: u64 = 0;
+static mut msr_amd64_de_cfg: u64 = 0;
+static mut msr_platform_info: u64 = 1 << 8;
+static mut msr_smi_count: u64 = 0;
+static mut msr_rtit_ctl: u64 = 0;
+static mut msr_pkg_c2_residency: u64 = 0;
+static mut msr_bios_sign_id: u64 = 0;
+static mut msr_apic_base_flags: i32 = IA32_APIC_BASE_BSP | IA32_APIC_BASE_EN;
 
 #[no_mangle]
 pub unsafe fn instr16_0F00_0_mem(addr: i32) {
@@ -1192,45 +1217,57 @@ pub unsafe fn instr_0F30() {
         IA32_SYSENTER_CS => *sysenter_cs = low & 0xFFFF,
         IA32_SYSENTER_EIP => *sysenter_eip = low,
         IA32_SYSENTER_ESP => *sysenter_esp = low,
-        IA32_FEAT_CTL => {}, // linux 5.x
-        MSR_TEST_CTRL => {}, // linux 5.x
+        IA32_FEAT_CTL => msr_feat_ctl = low as u32 as u64 | (high as u32 as u64) << 32,
+        MSR_TEST_CTRL => msr_test_ctrl = low as u32 as u64 | (high as u32 as u64) << 32,
         IA32_APIC_BASE => {
-            dbg_assert!(
-                high == 0,
-                "Changing APIC address (high 32 bits) not supported"
-            );
+            if high != 0 {
+                trigger_gp(0);
+                return;
+            }
             let address = low & !(IA32_APIC_BASE_BSP | IA32_APIC_BASE_EXTD | IA32_APIC_BASE_EN);
-            dbg_assert!(
-                (address == 0 && !*acpi_enabled) // windows me
-                || address == APIC_MEM_ADDRESS as i32,
-                "Changing APIC address not supported"
-            );
-            dbg_assert!(low & IA32_APIC_BASE_EXTD == 0, "x2apic not supported");
-            *apic_enabled = low & IA32_APIC_BASE_EN == IA32_APIC_BASE_EN
+            if !((address == 0 && !*acpi_enabled) || address == APIC_MEM_ADDRESS as i32) {
+                trigger_gp(0);
+                return;
+            }
+            if low & IA32_APIC_BASE_EXTD != 0 {
+                trigger_gp(0);
+                return;
+            }
+            msr_apic_base_flags = low & (IA32_APIC_BASE_BSP | IA32_APIC_BASE_EXTD | IA32_APIC_BASE_EN);
+            *apic_enabled = low & IA32_APIC_BASE_EN == IA32_APIC_BASE_EN;
         },
         IA32_TIME_STAMP_COUNTER => set_tsc(low as u32, high as u32),
         IA32_BIOS_UPDT_TRIG => {}, // windows xp
-        IA32_BIOS_SIGN_ID => {},
+        IA32_BIOS_SIGN_ID => msr_bios_sign_id = low as u32 as u64 | (high as u32 as u64) << 32,
         MISC_FEATURE_ENABLES => {
-            // Linux 4, see: https://patchwork.kernel.org/patch/9528279/
+            msr_misc_feature_enables = low as u32 as u64 | (high as u32 as u64) << 32;
         },
         IA32_MISC_ENABLE => {
-            // Enable Misc. Processor Features
+            msr_misc_enable = low as u32 as u64 | (high as u32 as u64) << 32;
         },
-        IA32_MCG_CAP => {}, // netbsd
+        IA32_MCG_CAP => msr_mcg_cap = low as u32 as u64 | (high as u32 as u64) << 32,
         IA32_KERNEL_GS_BASE => {
-            // Only used in 64 bit mode (by SWAPGS), but set by kvm-unit-test
-            dbg_log!("GS Base written");
+            msr_kernel_gs_base = low as u32 as u64 | (high as u32 as u64) << 32;
         },
-        IA32_PERFEVTSEL0 | IA32_PERFEVTSEL1 => {}, // linux/9legacy
-        IA32_PMC0 | IA32_PMC1 => {},               // linux
-        IA32_PAT => {},
-        IA32_SPEC_CTRL => {},      // linux 5.19
-        IA32_TSX_CTRL => {},       // linux 5.19
-        MSR_TSX_FORCE_ABORT => {}, // linux 5.19
-        IA32_MCU_OPT_CTRL => {},   // linux 5.19
-        MSR_AMD64_LS_CFG => {},    // linux 5.19
-        MSR_AMD64_DE_CFG => {},    // linux 6.1
+        IA32_PERFEVTSEL0 => msr_perfevtsel0 = low as u32 as u64 | (high as u32 as u64) << 32,
+        IA32_PERFEVTSEL1 => msr_perfevtsel1 = low as u32 as u64 | (high as u32 as u64) << 32,
+        IA32_PMC0 => msr_pmc0 = low as u32 as u64 | (high as u32 as u64) << 32,
+        IA32_PMC1 => msr_pmc1 = low as u32 as u64 | (high as u32 as u64) << 32,
+        IA32_PAT => msr_pat = low as u32 as u64 | (high as u32 as u64) << 32,
+        IA32_SPEC_CTRL => msr_spec_ctrl = low as u32 as u64 | (high as u32 as u64) << 32,
+        IA32_TSX_CTRL => msr_tsx_ctrl = low as u32 as u64 | (high as u32 as u64) << 32,
+        MSR_TSX_FORCE_ABORT => {
+            msr_tsx_force_abort = low as u32 as u64 | (high as u32 as u64) << 32;
+        },
+        IA32_MCU_OPT_CTRL => msr_mcu_opt_ctrl = low as u32 as u64 | (high as u32 as u64) << 32,
+        MSR_AMD64_LS_CFG => msr_amd64_ls_cfg = low as u32 as u64 | (high as u32 as u64) << 32,
+        MSR_AMD64_DE_CFG => msr_amd64_de_cfg = low as u32 as u64 | (high as u32 as u64) << 32,
+        MSR_PLATFORM_INFO => msr_platform_info = low as u32 as u64 | (high as u32 as u64) << 32,
+        IA32_RTIT_CTL => msr_rtit_ctl = low as u32 as u64 | (high as u32 as u64) << 32,
+        MSR_SMI_COUNT => msr_smi_count = low as u32 as u64 | (high as u32 as u64) << 32,
+        MSR_PKG_C2_RESIDENCY => {
+            msr_pkg_c2_residency = low as u32 as u64 | (high as u32 as u64) << 32;
+        },
         _ => {
             dbg_log!("Unknown msr: {:x}", index);
             trigger_gp(0);
@@ -1277,37 +1314,103 @@ pub unsafe fn instr_0F32() {
             low = tsc as i32;
             high = (tsc >> 32) as i32
         },
-        IA32_FEAT_CTL => {}, // linux 5.x
-        MSR_TEST_CTRL => {}, // linux 5.x
+        IA32_FEAT_CTL => {
+            low = msr_feat_ctl as i32;
+            high = (msr_feat_ctl >> 32) as i32;
+        },
+        MSR_TEST_CTRL => {
+            low = msr_test_ctrl as i32;
+            high = (msr_test_ctrl >> 32) as i32;
+        },
         IA32_PLATFORM_ID => {},
         IA32_APIC_BASE => {
             if *acpi_enabled {
-                low = APIC_MEM_ADDRESS as i32;
-                if *apic_enabled {
-                    low |= IA32_APIC_BASE_EN
-                }
+                low = APIC_MEM_ADDRESS as i32 | msr_apic_base_flags;
+            }
+            else {
+                low = msr_apic_base_flags;
             }
         },
-        IA32_BIOS_SIGN_ID => {},
-        MSR_PLATFORM_INFO => low = 1 << 8,
-        MISC_FEATURE_ENABLES => {},
-        IA32_MISC_ENABLE => {
-            // Enable Misc. Processor Features
-            low = 1 << 0; // fast string
+        IA32_BIOS_SIGN_ID => {
+            low = msr_bios_sign_id as i32;
+            high = (msr_bios_sign_id >> 32) as i32;
         },
-        IA32_RTIT_CTL => {}, // linux4
-        MSR_SMI_COUNT => {},
-        IA32_MCG_CAP => {},                        // netbsd
-        IA32_PERFEVTSEL0 | IA32_PERFEVTSEL1 => {}, // linux/9legacy
-        IA32_PMC0 | IA32_PMC1 => {},               // linux
-        IA32_PAT => {},
-        MSR_PKG_C2_RESIDENCY => {},
-        IA32_SPEC_CTRL => {},      // linux 5.19
-        IA32_TSX_CTRL => {},       // linux 5.19
-        MSR_TSX_FORCE_ABORT => {}, // linux 5.19
-        IA32_MCU_OPT_CTRL => {},   // linux 5.19
-        MSR_AMD64_LS_CFG => {},    // linux 5.19
-        MSR_AMD64_DE_CFG => {},    // linux 6.1
+        MSR_PLATFORM_INFO => {
+            low = msr_platform_info as i32;
+            high = (msr_platform_info >> 32) as i32;
+        },
+        MISC_FEATURE_ENABLES => {
+            low = msr_misc_feature_enables as i32;
+            high = (msr_misc_feature_enables >> 32) as i32;
+        },
+        IA32_MISC_ENABLE => {
+            low = msr_misc_enable as i32;
+            high = (msr_misc_enable >> 32) as i32;
+        },
+        IA32_RTIT_CTL => {
+            low = msr_rtit_ctl as i32;
+            high = (msr_rtit_ctl >> 32) as i32;
+        },
+        MSR_SMI_COUNT => {
+            low = msr_smi_count as i32;
+            high = (msr_smi_count >> 32) as i32;
+        },
+        IA32_MCG_CAP => {
+            low = msr_mcg_cap as i32;
+            high = (msr_mcg_cap >> 32) as i32;
+        },
+        IA32_PERFEVTSEL0 => {
+            low = msr_perfevtsel0 as i32;
+            high = (msr_perfevtsel0 >> 32) as i32;
+        },
+        IA32_PERFEVTSEL1 => {
+            low = msr_perfevtsel1 as i32;
+            high = (msr_perfevtsel1 >> 32) as i32;
+        },
+        IA32_PMC0 => {
+            low = msr_pmc0 as i32;
+            high = (msr_pmc0 >> 32) as i32;
+        },
+        IA32_PMC1 => {
+            low = msr_pmc1 as i32;
+            high = (msr_pmc1 >> 32) as i32;
+        },
+        IA32_PAT => {
+            low = msr_pat as i32;
+            high = (msr_pat >> 32) as i32;
+        },
+        MSR_PKG_C2_RESIDENCY => {
+            low = msr_pkg_c2_residency as i32;
+            high = (msr_pkg_c2_residency >> 32) as i32;
+        },
+        IA32_SPEC_CTRL => {
+            low = msr_spec_ctrl as i32;
+            high = (msr_spec_ctrl >> 32) as i32;
+        },
+        IA32_TSX_CTRL => {
+            low = msr_tsx_ctrl as i32;
+            high = (msr_tsx_ctrl >> 32) as i32;
+        },
+        MSR_TSX_FORCE_ABORT => {
+            low = msr_tsx_force_abort as i32;
+            high = (msr_tsx_force_abort >> 32) as i32;
+        },
+        IA32_MCU_OPT_CTRL => {
+            low = msr_mcu_opt_ctrl as i32;
+            high = (msr_mcu_opt_ctrl >> 32) as i32;
+        },
+        MSR_AMD64_LS_CFG => {
+            low = msr_amd64_ls_cfg as i32;
+            high = (msr_amd64_ls_cfg >> 32) as i32;
+        },
+        MSR_AMD64_DE_CFG => {
+            low = msr_amd64_de_cfg as i32;
+            high = (msr_amd64_de_cfg >> 32) as i32;
+        },
+        IA32_KERNEL_GS_BASE => {
+            low = msr_kernel_gs_base as i32;
+            high = (msr_kernel_gs_base >> 32) as i32;
+        },
         _ => {
             dbg_log!("Unknown msr: {:x}", index);
             trigger_gp(0);
@@ -1321,7 +1424,22 @@ pub unsafe fn instr_0F32() {
 #[no_mangle]
 pub unsafe fn instr_0F33() {
     // rdpmc
-    undefined_instruction();
+    if 0 != *cpl && 0 == *cr.offset(4) & CR4_PCE {
+        trigger_gp(0);
+        return;
+    }
+
+    let index = read_reg32(ECX) & 0x1F;
+    let value = match index {
+        0 => msr_pmc0,
+        1 => msr_pmc1,
+        _ => {
+            trigger_gp(0);
+            return;
+        },
+    };
+    write_reg32(EAX, value as i32);
+    write_reg32(EDX, (value >> 32) as i32);
 }
 #[no_mangle]
 pub unsafe fn instr_0F34() {
@@ -3310,8 +3428,48 @@ pub unsafe fn instr_0FA2() {
 
         0x80000000 => {
             // maximum supported extended level
-            eax = 5;
+            eax = 0x80000008u32 as i32;
             // other registers are reserved
+        },
+
+        0x80000001 => {
+            // extended feature bits (32-bit oriented)
+            eax = 0;
+            ebx = 0;
+            ecx = 0;
+            edx = 1 << 11; // SYSCALL/SYSRET availability
+        },
+
+        0x80000002 => {
+            // CPU brand string part 1: "v86 virtual cpu"
+            eax = 0x20763876;
+            ebx = 0x74726976;
+            ecx = 0x206c6175;
+            edx = 0x20757063;
+        },
+
+        0x80000003 => {
+            // CPU brand string part 2 (padding)
+            eax = 0x20202020;
+            ebx = 0x20202020;
+            ecx = 0x20202020;
+            edx = 0x20202020;
+        },
+
+        0x80000004 => {
+            // CPU brand string part 3 (padding)
+            eax = 0x20202020;
+            ebx = 0x20202020;
+            ecx = 0x20202020;
+            edx = 0x20202020;
+        },
+
+        0x80000008 => {
+            // virtual/physical address size: 32-bit virtual, 36-bit physical
+            eax = 0x0000_2024;
+            ebx = 0;
+            ecx = 0;
+            edx = 0;
         },
 
         0x40000000 => {
@@ -3355,7 +3513,15 @@ pub unsafe fn instr_0FA2() {
             read_reg32(ECX),
         );
     }
-    else if level != 0 && level != 2 && level != 0x80000000 {
+    else if level != 0
+        && level != 2
+        && level != 0x80000000
+        && level != 0x80000001u32
+        && level != 0x80000002u32
+        && level != 0x80000003u32
+        && level != 0x80000004u32
+        && level != 0x80000008u32
+    {
         dbg_log!("cpuid: eax={:08x}", read_reg32(EAX));
     }
 
@@ -3488,7 +3654,7 @@ pub unsafe fn instr_0FAE_1_reg(_r: i32) { trigger_ud(); }
 #[no_mangle]
 pub unsafe fn instr_0FAE_1_mem(addr: i32) { fxrstor(addr); }
 #[no_mangle]
-pub unsafe fn instr_0FAE_2_reg(_r: i32) { unimplemented_sse(); }
+pub unsafe fn instr_0FAE_2_reg(_r: i32) { trigger_ud(); }
 #[no_mangle]
 pub unsafe fn instr_0FAE_2_mem(addr: i32) {
     // ldmxcsr
@@ -3540,7 +3706,12 @@ pub unsafe fn instr_0FAE_7_reg(_r: i32) {
 #[no_mangle]
 pub unsafe fn instr_0FAE_7_mem(_addr: i32) {
     // clflush
-    undefined_instruction();
+    if let Err(()) = readable_or_pagefault(_addr, 1) {
+        *page_fault = true;
+    }
+    else {
+        *page_fault = false;
+    }
 }
 pub unsafe fn instr16_0FAF_mem(addr: i32, r: i32) {
     write_reg16(
