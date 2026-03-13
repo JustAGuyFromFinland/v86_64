@@ -367,7 +367,10 @@ pub unsafe fn setcc_mem(condition: bool, addr: i32) {
 }
 
 pub unsafe fn fxsave(addr: i32) {
-    dbg_assert!(addr & 0xF == 0, "TODO: #gp");
+    if addr & 0xF != 0 {
+        trigger_gp(0);
+        return;
+    }
     return_on_pagefault!(writable_or_pagefault(addr, 288));
 
     safe_write16(addr + 0, (*fpu_control_word).into()).unwrap();
@@ -395,7 +398,10 @@ pub unsafe fn fxsave(addr: i32) {
     }
 }
 pub unsafe fn fxrstor(addr: i32) {
-    dbg_assert!(addr & 0xF == 0, "TODO: #gp");
+    if addr & 0xF != 0 {
+        trigger_gp(0);
+        return;
+    }
     return_on_pagefault!(readable_or_pagefault(addr, 288));
 
     let new_mxcsr = safe_read32s(addr + 24).unwrap();

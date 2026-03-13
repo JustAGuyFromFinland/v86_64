@@ -1,11 +1,9 @@
 #![allow(non_snake_case)]
 
 unsafe fn undefined_instruction() {
-    dbg_assert!(false, "Undefined instructions");
     trigger_ud()
 }
 unsafe fn unimplemented_sse() {
-    dbg_assert!(false, "Unimplemented SSE instruction");
     trigger_ud()
 }
 
