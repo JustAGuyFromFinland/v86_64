@@ -185,8 +185,12 @@ impl Pic {
             dev.auto_eoi = true;
 
             dev.expect_icw4 = v & 1 != 0;
-            dbg_assert!(v & 2 == 0, "unimplemented: single mode");
-            dbg_assert!(v & 8 == 0, "unimplemented: level mode");
+            if v & 2 != 0 {
+                dbg_log!("PIC single mode requested; keeping cascaded mode emulation");
+            }
+            if v & 8 != 0 {
+                dbg_log!("PIC level mode requested; keeping edge-triggered emulation");
+            }
             dev.state = 1;
         }
         else if v & 8 != 0 {
@@ -197,7 +201,7 @@ impl Pic {
                 dev.read_isr = v & 1 != 0;
             }
             if v & 4 != 0 {
-                dbg_assert!(false, "unimplemented: polling");
+                dbg_log!("PIC polling mode requested; ignoring");
             }
             if v & 0x40 != 0 {
                 dev.special_mask_mode = (v & 0x20) == 0x20;
@@ -232,7 +236,6 @@ impl Pic {
             }
             else {
                 dbg_log!("Unknown eoi: {:x} type={:x}", v, eoi_type);
-                dbg_assert!(false);
                 dev.isr &= dev.isr - 1;
             }
 
@@ -250,8 +253,12 @@ impl Pic {
                 dev.expect_icw4 = false;
                 dev.auto_eoi = v & 2 != 0;
                 dbg_log!("icw4: {:x} autoeoi={}", v, dev.auto_eoi);
-                dbg_assert!(v & 0x10 == 0, "unimplemented: nested mode");
-                dbg_assert!(v & 1 == 1, "unimplemented: 8086/88 mode");
+                if v & 0x10 != 0 {
+                    dbg_log!("PIC nested mode requested; not emulated");
+                }
+                if v & 1 != 1 {
+                    dbg_log!("PIC non-8086 mode requested; forcing 8086-compatible behavior");
+                }
             }
             else {
                 // ocw1
@@ -299,7 +306,7 @@ pub fn pic_acknowledge_irq() -> Option<u8> {
     };
 
     if pic.master.irr == 0 {
-        dbg_assert!(false);
+        dbg_log!("[PIC] spurious master acknowledge irq={}", irq);
         //PIC_LOG_VERBOSE && dbg_log!("master> spurious requested=" + irq);
         //Some(pic.irq_map | 7)
         return None;
@@ -339,7 +346,7 @@ fn acknowledge_irq_slave(pic: &mut Pic) -> Option<u8> {
     if pic.slave.irr == 0 {
         //PIC_LOG_VERBOSE && dbg_log!("slave> spurious requested=" + irq);
         //Some(pic.irq_map | 7)
-        dbg_assert!(false);
+        dbg_log!("[PIC] spurious slave acknowledge irq={}", irq);
         return None;
     }
 

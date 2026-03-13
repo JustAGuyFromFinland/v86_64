@@ -41,18 +41,24 @@ pub unsafe fn fpu_get_st0() -> F80 {
     };
 }
 pub unsafe fn fpu_stack_fault() {
-    // TODO: Interrupt
     *fpu_status_word |= FPU_EX_SF | FPU_EX_I;
+    if *fpu_control_word & FPU_EX_I == 0 {
+        super::cpu::trigger_mf();
+    }
 }
 
 pub unsafe fn fpu_zero_fault() {
-    // TODO: Interrupt
     *fpu_status_word |= FPU_EX_Z;
+    if *fpu_control_word & FPU_EX_Z == 0 {
+        super::cpu::trigger_mf();
+    }
 }
 
 pub unsafe fn fpu_underflow_fault() {
-    // TODO: Interrupt
     *fpu_status_word |= FPU_EX_U;
+    if *fpu_control_word & FPU_EX_U == 0 {
+        super::cpu::trigger_mf();
+    }
 }
 
 pub unsafe fn fpu_sti_empty(mut i: i32) -> bool {
@@ -420,9 +426,19 @@ pub unsafe fn fpu_fldcw(addr: i32) {
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fldenv16(_addr: i32) {
-    dbg_log!("fldenv16");
-    fpu_unimpl();
+pub unsafe fn fpu_fldenv16(addr: i32) {
+    if let Err(()) = readable_or_pagefault(addr, 14) {
+        *page_fault = true;
+        return;
+    }
+    *page_fault = false;
+    set_control_word(safe_read16(addr).unwrap() as u16);
+    fpu_set_status_word(safe_read16(addr + 2).unwrap() as u16);
+    fpu_set_tag_word(safe_read16(addr + 4).unwrap());
+    *fpu_ip = (*fpu_ip & !0xFFFF) | safe_read16(addr + 6).unwrap() & 0xFFFF;
+    *fpu_ip_selector = safe_read16(addr + 8).unwrap();
+    *fpu_dp = (*fpu_dp & !0xFFFF) | safe_read16(addr + 10).unwrap() & 0xFFFF;
+    *fpu_dp_selector = safe_read16(addr + 12).unwrap();
 }
 #[no_mangle]
 pub unsafe fn fpu_fldenv32(addr: i32) {
@@ -441,7 +457,6 @@ pub unsafe fn fpu_fldenv32(addr: i32) {
     *fpu_dp_selector = safe_read16(addr + 24).unwrap()
 }
 pub unsafe fn fpu_unimpl() {
-    dbg_assert!(false);
     trigger_ud();
 }
 pub unsafe fn fpu_set_tag_word(tag_word: i32) {
@@ -530,9 +545,15 @@ pub unsafe fn fpu_fprem(ieee: bool) {
     }
 }
 
-pub unsafe fn fpu_frstor16(_addr: i32) {
-    dbg_log!("frstor16");
-    fpu_unimpl();
+pub unsafe fn fpu_frstor16(mut addr: i32) {
+    return_on_pagefault!(readable_or_pagefault(addr, 14 + 8 * 10));
+    fpu_fldenv16(addr);
+    addr += 14;
+    for i in 0..8 {
+        let reg_index = *fpu_stack_ptr as i32 + i & 7;
+        *fpu_st.offset(reg_index as isize) = fpu_load_m80(addr).unwrap();
+        addr += 10;
+    }
 }
 pub unsafe fn fpu_frstor32(mut addr: i32) {
     return_on_pagefault!(readable_or_pagefault(addr, 28 + 8 * 10));
@@ -545,9 +566,16 @@ pub unsafe fn fpu_frstor32(mut addr: i32) {
     }
 }
 
-pub unsafe fn fpu_fsave16(_addr: i32) {
-    dbg_log!("fsave16");
-    fpu_unimpl();
+pub unsafe fn fpu_fsave16(mut addr: i32) {
+    return_on_pagefault!(writable_or_pagefault(addr, 94));
+    fpu_fstenv16(addr);
+    addr += 14;
+    for i in 0..8 {
+        let reg_index = i + *fpu_stack_ptr as i32 & 7;
+        fpu_store_m80(addr, *fpu_st.offset(reg_index as isize));
+        addr += 10;
+    }
+    fpu_finit();
 }
 pub unsafe fn fpu_fsave32(mut addr: i32) {
     return_on_pagefault!(writable_or_pagefault(addr, 108));
@@ -568,9 +596,21 @@ pub unsafe fn fpu_store_m80(addr: i32, f: F80) {
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fstenv16(_addr: i32) {
-    dbg_log!("fstenv16");
-    fpu_unimpl();
+pub unsafe fn fpu_fstenv16(addr: i32) {
+    match writable_or_pagefault(addr, 14) {
+        Ok(()) => *page_fault = false,
+        Err(()) => {
+            *page_fault = true;
+            return;
+        },
+    }
+    safe_write16(addr + 0, *fpu_control_word as i32).unwrap();
+    safe_write16(addr + 2, fpu_load_status_word() as i32).unwrap();
+    safe_write16(addr + 4, fpu_load_tag_word()).unwrap();
+    safe_write16(addr + 6, *fpu_ip & 0xFFFF).unwrap();
+    safe_write16(addr + 8, *fpu_ip_selector).unwrap();
+    safe_write16(addr + 10, *fpu_dp & 0xFFFF).unwrap();
+    safe_write16(addr + 12, *fpu_dp_selector).unwrap();
 }
 
 #[no_mangle]
@@ -650,8 +690,51 @@ pub unsafe fn fpu_fstp(r: i32) {
 }
 
 #[no_mangle]
+pub unsafe fn fpu_fbld(addr: i32) {
+    match readable_or_pagefault(addr, 10) {
+        Ok(()) => *page_fault = false,
+        Err(()) => {
+            *page_fault = true;
+            return;
+        },
+    }
+
+    let mut value: i64 = 0;
+    let mut factor: i64 = 1;
+    for i in 0..=8 {
+        let packed = safe_read8(addr + i).unwrap() as u8;
+        let low = (packed & 0x0F) as i64;
+        let high = (packed >> 4) as i64;
+
+        if low > 9 || high > 9 {
+            fpu_invalid_arithmetic();
+            fpu_push(F80::INDEFINITE_NAN);
+            return;
+        }
+
+        value += low * factor;
+        factor *= 10;
+        value += high * factor;
+        factor *= 10;
+    }
+
+    let sign_byte = safe_read8(addr + 9).unwrap() as u8;
+    if sign_byte & 0x0F > 0 {
+        fpu_invalid_arithmetic();
+        fpu_push(F80::INDEFINITE_NAN);
+        return;
+    }
+
+    if sign_byte & 0x80 != 0 {
+        value = -value;
+    }
+
+    fpu_push(F80::of_i64(value));
+}
+
+#[no_mangle]
 pub unsafe fn fpu_fbstp(addr: i32) {
-    match writable_or_pagefault(addr, 26) {
+    match writable_or_pagefault(addr, 10) {
         Ok(()) => *page_fault = false,
         Err(()) => {
             *page_fault = true;

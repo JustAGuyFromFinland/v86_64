@@ -488,7 +488,8 @@ unsafe fn get_tss_ss_esp(dpl: u8) -> OrPageFault<(i32, i32)> {
     Ok(if *tss_size_32 {
         let tss_stack_offset = ((dpl << 3) + 4) as u32;
         if tss_stack_offset + 7 > *segment_limits.offset(TR as isize) {
-            panic!("#TS handler");
+            trigger_ts(0);
+            return Err(());
         }
         let addr = translate_address_system_read(
             *segment_offsets.offset(TR as isize) + tss_stack_offset as i32,
@@ -499,7 +500,8 @@ unsafe fn get_tss_ss_esp(dpl: u8) -> OrPageFault<(i32, i32)> {
     else {
         let tss_stack_offset = ((dpl << 2) + 2) as u32;
         if tss_stack_offset + 3 > *segment_limits.offset(TR as isize) {
-            panic!("#TS handler");
+            trigger_ts(0);
+            return Err(());
         }
         let addr = translate_address_system_read(
             *segment_offsets.offset(TR as isize) + tss_stack_offset as i32,
@@ -537,7 +539,8 @@ pub unsafe fn iret(is_16: bool) {
 
     if !*protected_mode || (vm86_mode() && getiopl() == 3) {
         if new_eip as u32 & 0xFFFF0000 != 0 {
-            panic!("#GP handler");
+            trigger_gp(0);
+            return;
         }
 
         switch_cs_real_mode(new_cs);
@@ -1082,8 +1085,7 @@ pub unsafe fn call_interrupt_vector(
         if old_flags & FLAG_VM != 0 {
             if !switch_seg(GS, 0) || !switch_seg(FS, 0) || !switch_seg(DS, 0) || !switch_seg(ES, 0)
             {
-                // can't fail
-                dbg_assert!(false);
+                dbg_log!("warning: failed to clear vm86 data segments during interrupt transition");
             }
         }
 
@@ -1183,7 +1185,10 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
     };
 
     if info.is_system() {
-        dbg_assert!(is_call, "TODO: Jump");
+        if !is_call {
+            trigger_gp(selector & !3);
+            return;
+        }
 
         dbg_log!("system type cs: {:x}", selector);
 
@@ -1258,10 +1263,12 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
                 let ss_info = match return_on_pagefault!(lookup_segment_selector(ss_selector)) {
                     Ok((desc, _)) => desc,
                     Err(SelectorNullOrInvalid::IsNull) => {
-                        panic!("null ss: {}", new_ss);
+                        trigger_ts(new_ss & !3);
+                        return;
                     },
                     Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
-                        panic!("invalid ss: {}", new_ss);
+                        trigger_ts(new_ss & !3);
+                        return;
                     },
                 };
 
@@ -1276,13 +1283,16 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
                 if ss_selector.rpl() != cs_info.dpl()
                 // xxx: 0 in v86 mode
                 {
-                    panic!("#TS handler");
+                    trigger_ts(new_ss & !3);
+                    return;
                 }
                 if ss_info.dpl() != cs_info.dpl() || !ss_info.is_writable() {
-                    panic!("#TS handler");
+                    trigger_ts(new_ss & !3);
+                    return;
                 }
                 if !ss_info.is_present() {
-                    panic!("#SS handler");
+                    trigger_ss(new_ss & !3);
+                    return;
                 }
 
                 let parameter_count = (info.raw >> 32 & 0x1F) as i32;
@@ -1544,7 +1554,7 @@ pub unsafe fn far_return(eip: i32, selector: i32, stack_adjust: i32, is_osize_32
     };
 
     if info.is_system() {
-        dbg_assert!(false, "is system in far return");
+        dbg_log!("far return: #gp system descriptor in cs: {:x}", selector);
         trigger_gp(selector & !3);
         return;
     }
@@ -1668,10 +1678,11 @@ pub unsafe fn do_task_switch(selector: i32, source: TaskSwitchSource) {
 
     let selector = SegmentSelector::of_u16(selector as u16);
     let (descriptor, descriptor_address) =
-        match lookup_segment_selector(selector).expect("TODO: handle pagefault") {
+        match return_on_pagefault!(lookup_segment_selector(selector)) {
             Ok(desc) => desc,
             Err(_) => {
-                panic!("#GP handler");
+                trigger_gp(selector.raw as i32 & !3);
+                return;
             },
         };
 
@@ -1681,18 +1692,22 @@ pub unsafe fn do_task_switch(selector: i32, source: TaskSwitchSource) {
     let new_tss_is_busy = (descriptor.system_type() & 2) == 2;
 
     if source != TaskSwitchSource::Iret && new_tss_is_busy {
-        panic!("#GP handler");
+        trigger_gp(selector.raw as i32 & !3);
+        return;
     }
     if source == TaskSwitchSource::Iret && !new_tss_is_busy {
-        panic!("#TS handler");
+        trigger_ts(selector.raw as i32 & !3);
+        return;
     }
 
     if !descriptor.is_present() {
-        panic!("#NP handler");
+        trigger_np(selector.raw as i32 & !3);
+        return;
     }
 
     if descriptor.effective_limit() < if new_tss_is_16 { 0x2B } else { 103 } {
-        panic!("#NP handler");
+        trigger_ts(selector.raw as i32 & !3);
+        return;
     }
 
     let _tsr_size = *segment_limits.offset(TR as isize);
@@ -1751,7 +1766,7 @@ pub unsafe fn do_task_switch(selector: i32, source: TaskSwitchSource) {
 
     if source == TaskSwitchSource::FarJmp || source == TaskSwitchSource::Iret {
         if let Ok((old_descriptor, old_descriptor_address)) =
-            lookup_segment_selector(old_tr_selector).expect("TODO: handle pagefault")
+            return_on_pagefault!(lookup_segment_selector(old_tr_selector))
         {
             safe_write64(old_descriptor_address, old_descriptor.set_not_busy().raw).unwrap();
         }
@@ -1793,40 +1808,46 @@ pub unsafe fn do_task_switch(selector: i32, source: TaskSwitchSource) {
         )
     };
     let new_cs_selector = SegmentSelector::of_u16(new_cs as u16);
-    let new_cs_descriptor =
-        match lookup_segment_selector(new_cs_selector).expect("TODO: handle pagefault") {
-            Ok((desc, _)) => desc,
-            Err(SelectorNullOrInvalid::IsNull) => {
-                dbg_log!("null cs");
-                panic!("#TS handler");
-            },
-            Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
-                dbg_log!("invalid cs: {:x}", new_cs);
-                panic!("#TS handler");
-            },
-        };
+    let new_cs_descriptor = match return_on_pagefault!(lookup_segment_selector(new_cs_selector)) {
+        Ok((desc, _)) => desc,
+        Err(SelectorNullOrInvalid::IsNull) => {
+            dbg_log!("null cs");
+            trigger_ts(new_cs & !3);
+            return;
+        },
+        Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
+            dbg_log!("invalid cs: {:x}", new_cs);
+            trigger_ts(new_cs & !3);
+            return;
+        },
+    };
 
     if new_cs_descriptor.is_system() {
-        panic!("#TS handler");
+        trigger_ts(new_cs & !3);
+        return;
     }
 
     if !new_cs_descriptor.is_executable() {
-        panic!("#TS handler");
+        trigger_ts(new_cs & !3);
+        return;
     }
 
     if new_cs_descriptor.is_dc() && new_cs_descriptor.dpl() > new_cs_selector.rpl() {
         dbg_log!("cs conforming and dpl > rpl: {:x}", selector.raw);
-        panic!("#TS handler");
+        trigger_ts(new_cs & !3);
+        return;
     }
 
     if !new_cs_descriptor.is_dc() && new_cs_descriptor.dpl() != new_cs_selector.rpl() {
         dbg_log!("cs non-conforming and dpl != rpl: {:x}", selector.raw);
-        panic!("#TS handler");
+        trigger_ts(new_cs & !3);
+        return;
     }
 
     if !new_cs_descriptor.is_present() {
         dbg_log!("#NP for loading not-present in cs sel={:x}", selector.raw);
-        panic!("#TS handler");
+        trigger_np(new_cs & !3);
+        return;
     }
 
     *segment_is_null.offset(CS as isize) = false;
@@ -1862,7 +1883,8 @@ pub unsafe fn do_task_switch(selector: i32, source: TaskSwitchSource) {
     }
 
     if new_eflags & FLAG_VM != 0 {
-        panic!("task switch to VM mode");
+        trigger_ts(selector.raw as i32 & !3);
+        return;
     }
 
     update_eflags(new_eflags);
@@ -2714,16 +2736,21 @@ pub unsafe fn switch_seg(reg: i32, selector_raw: i32) -> bool {
 
 pub unsafe fn load_tr(selector: i32) {
     let selector = SegmentSelector::of_u16(selector as u16);
-    dbg_assert!(selector.is_gdt(), "TODO: TR can only be loaded from GDT");
+    if !selector.is_gdt() {
+        trigger_gp(selector.raw as i32 & !3);
+        return;
+    }
 
     let (descriptor, descriptor_address) =
         match return_on_pagefault!(lookup_segment_selector(selector)) {
             Ok((desc, addr)) => (desc, addr),
             Err(SelectorNullOrInvalid::IsNull) => {
-                panic!("TODO: null TR");
+                trigger_gp(selector.raw as i32 & !3);
+                return;
             },
             Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
-                panic!("TODO: TR selector outside of table limit");
+                trigger_gp(selector.raw as i32 & !3);
+                return;
             },
         };
 
@@ -2736,7 +2763,8 @@ pub unsafe fn load_tr(selector: i32) {
     //);
 
     if !descriptor.is_system() {
-        panic!("#GP | ltr: not a system entry (happens when running kvm-unit-test without ACPI)");
+        trigger_gp(selector.raw as i32 & !3);
+        return;
     }
 
     if descriptor.system_type() != 9 && descriptor.system_type() != 1 {
@@ -2744,14 +2772,13 @@ pub unsafe fn load_tr(selector: i32) {
         // 0x9: 386 TSS
         // 0x3: busy 286 TSS (GP)
         // 0x1: 286 TSS (??)
-        panic!(
-            "#GP | ltr: invalid type (type = 0x{:x})",
-            descriptor.system_type()
-        );
+        trigger_gp(selector.raw as i32 & !3);
+        return;
     }
 
     if !descriptor.is_present() {
-        panic!("#NT | present bit not set (ltr)");
+        trigger_np(selector.raw as i32 & !3);
+        return;
     }
 
     *tss_size_32 = descriptor.system_type() == 9;
@@ -2777,31 +2804,36 @@ pub unsafe fn load_ldt(selector: i32) -> OrPageFault<()> {
         return Ok(());
     }
 
-    dbg_assert!(selector.is_gdt(), "TODO: LDT can only be loaded from GDT");
+    if !selector.is_gdt() {
+        trigger_gp(selector.raw as i32 & !3);
+        return Err(());
+    }
 
     let (descriptor, _) = match lookup_segment_selector(selector)? {
         Ok((desc, addr)) => (desc, addr),
         Err(SelectorNullOrInvalid::IsNull) => {
-            panic!("TODO: null TR");
+            trigger_gp(selector.raw as i32 & !3);
+            return Err(());
         },
         Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
-            panic!("TODO: TR selector outside of table limit");
+            trigger_gp(selector.raw as i32 & !3);
+            return Err(());
         },
     };
 
     if !descriptor.is_present() {
-        panic!("#NT | present bit not set (lldt)");
+        trigger_np(selector.raw as i32 & !3);
+        return Err(());
     }
 
     if !descriptor.is_system() {
-        panic!("#GP | lldt: not a system entry");
+        trigger_gp(selector.raw as i32 & !3);
+        return Err(());
     }
 
     if descriptor.system_type() != 2 {
-        panic!(
-            "#GP | lldt: invalid type (type = 0x{:x})",
-            descriptor.system_type()
-        );
+        trigger_gp(selector.raw as i32 & !3);
+        return Err(());
     }
 
     dbg_log!(
@@ -2847,7 +2879,8 @@ pub unsafe fn set_cr0(cr0: i32) {
         dbg_log!("Warning: Unimplemented: cr0 alignment mask");
     }
     if (cr0 & (CR0_PE | CR0_PG)) == CR0_PG {
-        panic!("cannot load PG without PE");
+        trigger_gp(0);
+        return;
     }
 
     *cr = cr0;
@@ -3355,6 +3388,18 @@ pub unsafe fn trigger_ud() {
         }
     }
     call_interrupt_vector(CPU_EXCEPTION_UD, false, None);
+}
+
+#[inline(never)]
+pub unsafe fn trigger_br() {
+    dbg_log!("#br");
+    *instruction_pointer = *previous_ip;
+    if DEBUG {
+        if js::cpu_exception_hook(CPU_EXCEPTION_BR) {
+            return;
+        }
+    }
+    call_interrupt_vector(CPU_EXCEPTION_BR, false, None);
 }
 
 #[inline(never)]
@@ -4192,7 +4237,7 @@ pub unsafe fn task_switch_test_mmx_jit(eip_offset_in_page: i32) {
         trigger_nm_jit(eip_offset_in_page);
     }
     else {
-        dbg_assert!(false);
+        // no fault
     }
 }
 

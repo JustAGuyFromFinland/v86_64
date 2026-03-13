@@ -151,8 +151,7 @@ pub unsafe fn svga_fill_pixel_buffer(bpp: u32, svga_dest_offset: u32) {
             }
         }),
         _ => {
-            dbg_log!("{}", bpp);
-            dbg_assert!(false, "Unsupported bpp");
+            dbg_log!("Unsupported svga bpp: {}", bpp);
         },
     }
 

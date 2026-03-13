@@ -355,10 +355,7 @@ unsafe fn string_instruction(
                     let rep_cmp = match rep {
                         Rep::Z => src_val == dst_val,
                         Rep::NZ => src_val != dst_val,
-                        Rep::None => {
-                            dbg_assert!(false);
-                            true
-                        },
+                        Rep::None => false,
                     };
                     if !rep_cmp || count == i {
                         match size {

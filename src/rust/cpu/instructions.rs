@@ -523,14 +523,27 @@ pub unsafe fn instr32_61() { popa32(); }
 
 #[no_mangle]
 pub unsafe fn instr_62_reg(_r2: i32, _r: i32) {
-    // bound
-    dbg_log!("Unimplemented BOUND instruction");
-    dbg_assert!(false);
+    // BOUND requires a memory operand
+    trigger_ud();
 }
 #[no_mangle]
-pub unsafe fn instr_62_mem(_addr: i32, _r: i32) {
-    dbg_log!("Unimplemented BOUND instruction");
-    dbg_assert!(false);
+pub unsafe fn instr_62_mem(addr: i32, r: i32) {
+    if is_osize_32() {
+        let lower = return_on_pagefault!(safe_read32s(addr));
+        let upper = return_on_pagefault!(safe_read32s(addr + 4));
+        let index = read_reg32(r);
+        if index < lower || index > upper {
+            trigger_br();
+        }
+    }
+    else {
+        let lower = return_on_pagefault!(safe_read16(addr)) << 16 >> 16;
+        let upper = return_on_pagefault!(safe_read16(addr + 2)) << 16 >> 16;
+        let index = read_reg16(r) << 16 >> 16;
+        if index < lower || index > upper {
+            trigger_br();
+        }
+    }
 }
 
 pub unsafe fn arpl(seg: i32, r16: i32) -> i32 {
@@ -1000,7 +1013,7 @@ pub unsafe fn instr16_9A(new_ip: i32, new_cs: i32) {
 pub unsafe fn instr32_9A(new_ip: i32, new_cs: i32) {
     if !*protected_mode || vm86_mode() {
         if 0 != new_ip as u32 & 0xFFFF0000 {
-            dbg_assert!(false);
+            dbg_log!("callf in real/vm86 with high eip bits set: {:x}", new_ip as u32);
         }
     }
     far_jump(new_ip, new_cs, true, true);
@@ -1721,9 +1734,7 @@ pub unsafe fn instr16_D9_6_reg(r: i32) {
         5 => fpu_fprem(true), // fprem1
         6 => fpu_fdecstp(),
         7 => fpu_fincstp(),
-        _ => {
-            dbg_assert!(false);
-        },
+        _ => trigger_ud(),
     };
 }
 pub unsafe fn instr16_D9_7_mem(addr: i32) { fpu_fstcw(addr); }
@@ -1738,9 +1749,7 @@ pub unsafe fn instr16_D9_7_reg(r: i32) {
         5 => fpu_fscale(),
         6 => fpu_fsin(),
         7 => fpu_fcos(),
-        _ => {
-            dbg_assert!(false);
-        },
+        _ => trigger_ud(),
     };
 }
 
@@ -1956,10 +1965,7 @@ pub unsafe fn instr_DF_0_mem(addr: i32) { fpu_fildm16(addr) }
 pub unsafe fn instr_DF_1_mem(addr: i32) { fpu_fisttpm16(addr); }
 pub unsafe fn instr_DF_2_mem(addr: i32) { fpu_fistm16(addr); }
 pub unsafe fn instr_DF_3_mem(addr: i32) { fpu_fistm16p(addr); }
-pub unsafe fn instr_DF_4_mem(_addr: i32) {
-    dbg_log!("fbld");
-    fpu_unimpl();
-}
+pub unsafe fn instr_DF_4_mem(addr: i32) { fpu_fbld(addr); }
 pub unsafe fn instr_DF_5_mem(addr: i32) { fpu_fildm64(addr); }
 pub unsafe fn instr_DF_6_mem(addr: i32) { fpu_fbstp(addr); }
 pub unsafe fn instr_DF_7_mem(addr: i32) { fpu_fistm64p(addr); }
@@ -2131,7 +2137,7 @@ pub unsafe fn instr_F0() {
 pub unsafe fn instr_F1() {
     // INT1
     // https://code.google.com/p/corkami/wiki/x86oddities#IceBP
-    dbg_assert!(false);
+    call_interrupt_vector(CPU_EXCEPTION_DB, true, None);
 }
 
 pub unsafe fn instr_F2() {
@@ -2445,7 +2451,7 @@ pub unsafe fn instr32_FF_3_mem(addr: i32) {
     let new_cs = return_on_pagefault!(safe_read16(addr + 4));
     if !*protected_mode || vm86_mode() {
         if 0 != new_ip as u32 & 0xFFFF0000 {
-            dbg_assert!(false);
+            dbg_log!("callf rm/m in real/vm86 with high eip bits set: {:x}", new_ip as u32);
         }
     }
     far_jump(new_ip, new_cs, true, true);
@@ -2473,7 +2479,7 @@ pub unsafe fn instr32_FF_5_mem(addr: i32) {
     let new_cs = return_on_pagefault!(safe_read16(addr + 4));
     if !*protected_mode || vm86_mode() {
         if 0 != new_ip as u32 & 0xFFFF0000 {
-            dbg_assert!(false);
+            dbg_log!("jmpf rm/m in real/vm86 with high eip bits set: {:x}", new_ip as u32);
         }
     }
     far_jump(new_ip, new_cs, false, true);

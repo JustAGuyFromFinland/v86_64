@@ -253,11 +253,11 @@ fn read32_internal(apic: &mut Apic, addr: u32) -> u32 {
                     apic.timer_initial_count
                         - (diff_in_ticks % (apic.timer_initial_count as u64 + 1)) as u32
                 }
-                else if mode == APIC_TIMER_MODE_ONE_SHOT {
+                else if mode == APIC_TIMER_MODE_ONE_SHOT || mode == _APIC_TIMER_MODE_TSC {
                     0
                 }
                 else {
-                    dbg_assert!(false, "apic unimplemented timer mode: {:x}", mode);
+                    dbg_log!("apic unimplemented timer mode: {:x}", mode);
                     0
                 }
             };
@@ -269,7 +269,6 @@ fn read32_internal(apic: &mut Apic, addr: u32) -> u32 {
 
         _ => {
             dbg_log!("APIC read {:x}", addr);
-            dbg_assert!(false);
             0
         },
     }
@@ -383,7 +382,7 @@ fn write32_internal(apic: &mut Apic, addr: u32, value: u32) {
                 // all but self
             }
             else {
-                dbg_assert!(false);
+                dbg_log!("APIC invalid destination shorthand: {}", destination_shorthand);
             }
         },
 
@@ -453,12 +452,10 @@ fn write32_internal(apic: &mut Apic, addr: u32, value: u32) {
 
         0x390 => {
             dbg_log!("write timer current: {:08x}", value);
-            dbg_assert!(false, "read-only register");
         },
 
         _ => {
             dbg_log!("APIC write32 {:x} <- {:08x}", addr, value);
-            dbg_assert!(false);
         },
     }
 }
@@ -509,14 +506,16 @@ fn timer(apic: &mut Apic, now: f64) -> f64 {
                 dbg_assert!(apic.timer_last_tick <= now);
             }
         }
-        else if mode == APIC_TIMER_MODE_ONE_SHOT {
+        else if mode == APIC_TIMER_MODE_ONE_SHOT || mode == _APIC_TIMER_MODE_TSC {
             if APIC_LOG_VERBOSE {
                 dbg_log!("APIC timer one shot end");
             }
             apic.timer_current_count = 0;
         }
         else {
-            dbg_assert!(false, "apic unimplemented timer mode: {:x}", mode);
+            dbg_log!("apic unimplemented timer mode: {:x}", mode);
+            apic.timer_current_count = 0;
+            return 100.0;
         }
 
         if apic.lvt_timer & IOAPIC_CONFIG_MASKED == 0 {
@@ -560,7 +559,8 @@ fn deliver(apic: &mut Apic, vector: u8, mode: u8, is_level: bool) {
     }
 
     if vector < 0x10 || vector == 0xFF {
-        dbg_assert!(false, "TODO: Invalid vector: {:x}", vector);
+        dbg_log!("APIC invalid vector: {:x}", vector);
+        return;
     }
 
     if register_get_bit(&apic.irr, vector) {

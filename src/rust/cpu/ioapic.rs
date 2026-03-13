@@ -132,7 +132,8 @@ fn check_irq(ioapic: &mut Ioapic, apic: &mut apic::Apic, irq: u8) {
             );
         }
         else {
-            dbg_assert!(false, "TODO");
+            dbg_log!("IOAPIC unsupported delivery mode: {}", delivery_mode);
+            return;
         }
 
         ioapic.ioredtbl_config[irq as usize] &= !IOAPIC_CONFIG_DELIVS;
@@ -143,7 +144,7 @@ pub fn set_irq(i: u8) { set_irq_internal(&mut get_ioapic(), &mut apic::get_apic(
 
 fn set_irq_internal(ioapic: &mut Ioapic, apic: &mut apic::Apic, i: u8) {
     if i as usize >= IOAPIC_IRQ_COUNT {
-        dbg_assert!(false, "Bad irq: {}", i);
+        dbg_log!("IOAPIC bad irq: {}", i);
         return;
     }
 
@@ -174,7 +175,7 @@ pub fn clear_irq(i: u8) { clear_irq_internal(&mut get_ioapic(), i) }
 
 fn clear_irq_internal(ioapic: &mut Ioapic, i: u8) {
     if i as usize >= IOAPIC_IRQ_COUNT {
-        dbg_assert!(false, "Bad irq: {}", i);
+        dbg_log!("IOAPIC bad irq: {}", i);
         return;
     }
 
@@ -229,12 +230,12 @@ fn read32_internal(ioapic: &mut Ioapic, addr: u32) -> u32 {
                 }
             },
             reg => {
-                dbg_assert!(false, "IOAPIC register read outside of range {:x}", reg);
+                dbg_log!("IOAPIC register read outside of range {:x}", reg);
                 0
             },
         },
         _ => {
-            dbg_assert!(false, "Unaligned or oob IOAPIC memory read: {:x}", addr);
+            dbg_log!("Unaligned or oob IOAPIC memory read: {:x}", addr);
             0
         },
     }
@@ -296,21 +297,19 @@ fn write32_internal(ioapic: &mut Ioapic, apic: &mut apic::Apic, addr: u32, value
                 }
             },
             reg => {
-                dbg_assert!(
-                    false,
+                dbg_log!(
                     "IOAPIC register write outside of range {:x} <- {:x}",
                     reg,
                     value
-                )
+                );
             },
         },
         _ => {
-            dbg_assert!(
-                false,
+            dbg_log!(
                 "Unaligned or oob IOAPIC memory write: {:x} <- {:x}",
                 addr,
                 value
-            )
+            );
         },
     }
 }

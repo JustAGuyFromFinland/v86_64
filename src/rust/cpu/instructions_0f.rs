@@ -1233,7 +1233,8 @@ pub unsafe fn instr_0F30() {
         MSR_AMD64_DE_CFG => {},    // linux 6.1
         _ => {
             dbg_log!("Unknown msr: {:x}", index);
-            dbg_assert!(false);
+            trigger_gp(0);
+            return;
         },
     }
 }
@@ -1309,7 +1310,8 @@ pub unsafe fn instr_0F32() {
         MSR_AMD64_DE_CFG => {},    // linux 6.1
         _ => {
             dbg_log!("Unknown msr: {:x}", index);
-            dbg_assert!(false);
+            trigger_gp(0);
+            return;
         },
     }
 
