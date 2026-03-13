@@ -268,7 +268,11 @@ pub unsafe fn psllq_r128(r: i32, shift: u64) {
 }
 
 pub unsafe fn sse_comparison(op: i32, x: f64, y: f64) -> bool {
-    // TODO: Signaling
+    // Signal invalid operation on NaN operands when required.
+    if x.is_nan() || y.is_nan() {
+        *mxcsr |= 1; // Invalid Operation flag
+    }
+
     match op & 7 {
         0 => return x == y,
         1 => return x < y,
@@ -297,7 +301,8 @@ pub unsafe fn sse_convert_with_truncation_f32_to_i32(x: f32) -> i32 {
         return x as i64 as i32;
     }
     else {
-        // TODO: Signal
+        // Signal invalid operation
+        *mxcsr |= 1;
         return -0x80000000;
     };
 }
@@ -308,7 +313,8 @@ pub unsafe fn sse_convert_f32_to_i32(x: f32) -> i32 {
         return x as i64 as i32;
     }
     else {
-        // TODO: Signal
+        // Signal invalid operation
+        *mxcsr |= 1;
         return -0x80000000;
     };
 }
@@ -320,7 +326,8 @@ pub unsafe fn sse_convert_with_truncation_f64_to_i32(x: f64) -> i32 {
         return x as i64 as i32;
     }
     else {
-        // TODO: Signal
+        // Signal invalid operation
+        *mxcsr |= 1;
         return -0x80000000;
     };
 }
@@ -331,7 +338,8 @@ pub unsafe fn sse_convert_f64_to_i32(x: f64) -> i32 {
         return x as i64 as i32;
     }
     else {
-        // TODO: Signal
+        // Signal invalid operation
+        *mxcsr |= 1;
         return -0x80000000;
     };
 }
