@@ -1,6 +1,107 @@
 import { dbg_assert } from "../log.js";
 import { load_file } from "../lib.js";
 
+// Optional disk-fetch worker to offload image reads from the main thread.
+const disk_worker_supported = typeof Worker !== "undefined";
+let disk_worker = null;
+let disk_request_id = 0;
+const disk_requests = new Map();
+
+if(globalThis.USE_DISK_WORKER && disk_worker_supported)
+{
+    try
+    {
+        const base = (typeof document !== "undefined" && document.baseURI) ? document.baseURI : (typeof location !== "undefined" ? location.href : undefined);
+        const worker_relative = "src/browser/disk_worker.js";
+        const worker_url = base ? new URL(worker_relative, base).toString() : worker_relative;
+        disk_worker = new Worker(worker_url, { type: "module" });
+
+        disk_worker.onmessage = ev =>
+        {
+            const msg = ev.data;
+            const pending = msg && disk_requests.get(msg.id);
+            if(!pending) return;
+
+            switch(msg.type)
+            {
+                case "progress":
+                    if(pending.progress)
+                    {
+                        pending.progress({ loaded: msg.loaded, total: msg.total });
+                    }
+                    break;
+                case "done":
+                    disk_requests.delete(msg.id);
+                    if(msg.error)
+                    {
+                        pending.reject(new Error(msg.error));
+                    }
+                    else if(pending.as_json)
+                    {
+                        pending.resolve(msg.json);
+                    }
+                    else
+                    {
+                        pending.resolve(msg.buffer);
+                    }
+                    break;
+                case "error":
+                    disk_requests.delete(msg.id);
+                    pending.reject(new Error(msg.message || "disk worker error"));
+                    break;
+                default:
+                    break;
+            }
+        };
+
+        disk_worker.onerror = e =>
+        {
+            disk_requests.forEach(p => p.reject(e));
+            disk_requests.clear();
+            disk_worker = null;
+        };
+    }
+    catch(e)
+    {
+        disk_worker = null;
+    }
+}
+
+async function load_file_via_disk_worker(filename, options)
+{
+    if(!disk_worker)
+    {
+        return await new Promise((resolve, reject) => {
+            load_file(filename, {
+                ...options,
+                done: resolve,
+                progress: options?.progress,
+            });
+        });
+    }
+
+    return await new Promise((resolve, reject) => {
+        const id = ++disk_request_id;
+        disk_requests.set(id, {
+            resolve,
+            reject,
+            progress: options?.progress,
+            as_json: !!options?.as_json,
+        });
+
+        disk_worker.postMessage({
+            type: "load",
+            id,
+            url: filename,
+            as_json: !!options?.as_json,
+            range: options?.range || null,
+            headers: options?.headers || null,
+        });
+    });
+}
+
+export { load_file_via_disk_worker as load_file_offthread };
+
 /** @interface */
 export function FileStorageInterface() {}
 
@@ -105,23 +206,18 @@ export function ServerFileStorageWrapper(file_storage, baseurl, zstd_decompress)
  * @param {number} file_size
  * @return {!Promise<Uint8Array>}
  */
-ServerFileStorageWrapper.prototype.load_from_server = function(sha256sum, file_size)
+ServerFileStorageWrapper.prototype.load_from_server = async function(sha256sum, file_size)
 {
-    return new Promise((resolve, reject) =>
+    const buffer = await load_file_via_disk_worker(this.baseurl + sha256sum, { as_json: false });
+    let data = new Uint8Array(buffer);
+    if(sha256sum.endsWith(".zst"))
     {
-        load_file(this.baseurl + sha256sum, { done: async buffer =>
-        {
-            let data = new Uint8Array(buffer);
-            if(sha256sum.endsWith(".zst"))
-            {
-                data = new Uint8Array(
-                    this.zstd_decompress(file_size, data)
-                );
-            }
-            await this.cache(sha256sum, data);
-            resolve(data);
-        }});
-    });
+        data = new Uint8Array(
+            this.zstd_decompress(file_size, data)
+        );
+    }
+    await this.cache(sha256sum, data);
+    return data;
 };
 
 /**

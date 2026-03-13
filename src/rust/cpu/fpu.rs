@@ -308,7 +308,12 @@ pub unsafe fn set_control_word(cw: u16) {
     });
 }
 
-pub unsafe fn fpu_invalid_arithmetic() { *fpu_status_word |= FPU_EX_I; }
+pub unsafe fn fpu_invalid_arithmetic() { 
+    *fpu_status_word |= FPU_EX_I; 
+    if *fpu_control_word & FPU_EX_I == 0 {
+        super::cpu::trigger_mf();
+    }
+}
 
 #[no_mangle]
 pub unsafe fn fpu_convert_to_i16(f: F80) -> i16 {

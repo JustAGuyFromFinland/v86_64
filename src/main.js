@@ -19,6 +19,7 @@ export function v86(bus, wasm)
 
     this.tick_counter = 0;
     this.worker = null;
+    this.clock_source = wasm?.clock_source === "native" ? "native" : "hpet";
 
     /** @type {CPU} */
     this.cpu = new CPU(bus, wasm, () => { this.idle && this.next_tick(0); });
@@ -132,26 +133,107 @@ else if(typeof Worker !== "undefined")
     function the_worker()
     {
         let timeout;
+        let clock_source = "hpet";
         globalThis.onmessage = function(e)
         {
+            if(e.data?.cmd === "init")
+            {
+                clock_source = e.data.clock_source === "native" ? "native" : "hpet";
+                return;
+            }
+
             const t = e.data.t;
             timeout = timeout && clearTimeout(timeout);
-            if(t < 1) postMessage(e.data.tick);
-            else timeout = setTimeout(() => postMessage(e.data.tick), t);
+            if(t < 1)
+            {
+                postMessage(e.data.tick);
+            }
+            else if(clock_source === "hpet" && typeof performance !== "undefined" && typeof performance.now === "function")
+            {
+                const target = performance.now() + t;
+                const schedule = () => {
+                    const remaining = target - performance.now();
+                    if(remaining <= 0)
+                    {
+                        postMessage(e.data.tick);
+                        timeout = undefined;
+                    }
+                    else
+                    {
+                        timeout = setTimeout(schedule, Math.min(remaining, 4));
+                    }
+                };
+                timeout = setTimeout(schedule, Math.min(t, 4));
+            }
+            else
+            {
+                timeout = setTimeout(() => postMessage(e.data.tick), t);
+            }
         };
+    }
+
+    function create_module_tick_worker()
+    {
+        const base = (typeof document !== "undefined" && document.baseURI) ? document.baseURI : (typeof location !== "undefined" ? location.href : undefined);
+        const worker_relative = "src/browser/tick_worker.js";
+        const worker_url = base ? new URL(worker_relative, base).toString() : worker_relative;
+        return new Worker(worker_url, { type: "module" });
+    }
+
+    function create_blob_tick_worker()
+    {
+        const url = URL.createObjectURL(new Blob(["(" + the_worker.toString() + ")()"], { type: "text/javascript" }));
+        const worker = new Worker(url);
+        URL.revokeObjectURL(url);
+        return worker;
     }
 
     v86.prototype.register_yield = function()
     {
-        const url = URL.createObjectURL(new Blob(["(" + the_worker.toString() + ")()"], { type: "text/javascript" }));
-        this.worker = new Worker(url);
-        this.worker.onmessage = e => this.yield_callback(e.data);
-        URL.revokeObjectURL(url);
+        this.worker = null;
+
+        if(globalThis.USE_TICK_WORKER)
+        {
+            try
+            {
+                this.worker = create_module_tick_worker();
+            }
+            catch(e)
+            {
+                this.worker = null;
+            }
+        }
+
+        if(!this.worker)
+        {
+            try
+            {
+                this.worker = create_blob_tick_worker();
+            }
+            catch(e)
+            {
+                this.worker = null;
+            }
+        }
+
+        if(this.worker)
+        {
+            this.worker.onmessage = e => this.yield_callback(e.data);
+            this.worker.postMessage({ cmd: "init", clock_source: this.clock_source });
+        }
     };
 
     v86.prototype.yield = function(t, tick)
     {
-        this.worker.postMessage({ t, tick });
+        const delay = Math.max(0, t);
+        if(this.worker)
+        {
+            this.worker.postMessage({ t: delay, tick });
+        }
+        else
+        {
+            setTimeout(() => this.yield_callback(tick), delay);
+        }
     };
 
     v86.prototype.unregister_yield = function()

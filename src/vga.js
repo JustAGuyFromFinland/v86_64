@@ -384,6 +384,13 @@ export function VGAScreen(cpu, bus, screen, vga_memory_size)
     this.webgpu_dac_map_u32 = new Uint32Array(0x10);
     this.webgpu_planes_u8 = new Uint8Array(4 * VGA_BANK_SIZE);
 
+    this.use_vga_worker = !!(globalThis && globalThis.USE_VGA_WORKER && typeof Worker !== "undefined");
+    this.vga_worker = null;
+    this.vga_worker_busy = false;
+    this.vga_worker_seq = 0;
+    this.vga_worker_generation = 0;
+    this.vga_worker_pending_mode = null;
+
     io.mmap_register(0xA0000, 0x20000,
         addr => this.vga_memory_read(addr),
         (addr, value) => this.vga_memory_write(addr, value),
@@ -961,6 +968,8 @@ VGAScreen.prototype.complete_redraw = function()
 {
     dbg_log("complete redraw", LOG_VGA);
 
+    this.vga_worker_generation++;
+
     if(this.graphical_mode)
     {
         if(this.svga_enabled)
@@ -983,6 +992,8 @@ VGAScreen.prototype.complete_replot = function()
 {
     dbg_log("complete replot", LOG_VGA);
 
+    this.vga_worker_generation++;
+
     if(!this.graphical_mode || this.svga_enabled)
     {
         return;
@@ -996,6 +1007,7 @@ VGAScreen.prototype.complete_replot = function()
 
 VGAScreen.prototype.partial_redraw = function(min, max)
 {
+    this.vga_worker_generation++;
     if(min < this.diff_addr_min) this.diff_addr_min = min;
     if(max > this.diff_addr_max) this.diff_addr_max = max;
 };
@@ -1014,6 +1026,242 @@ VGAScreen.prototype.reset_diffs = function()
     this.diff_addr_max = 0;
     this.diff_plot_min = this.vga_memory_size;
     this.diff_plot_max = 0;
+};
+
+VGAScreen.prototype.ensure_vga_worker = function()
+{
+    if(!this.use_vga_worker || this.vga_worker)
+    {
+        return this.vga_worker;
+    }
+
+    try
+    {
+        const base = (typeof document !== "undefined" && document.baseURI) ? document.baseURI : (typeof location !== "undefined" ? location.href : undefined);
+        const worker_relative = "src/browser/vga_worker.js";
+        const worker_url = base ? new URL(worker_relative, base).toString() : worker_relative;
+        this.vga_worker = new Worker(worker_url, { type: "module" });
+
+        this.vga_worker.onmessage = e =>
+        {
+            const msg = e.data;
+            if(!msg)
+            {
+                return;
+            }
+
+            if(msg.type === "vga-render-done" || msg.type === "svga-render-done" || msg.type === "vga-webgpu-done")
+            {
+                this.vga_worker_busy = false;
+
+                // Drop stale results if new changes happened after dispatch
+                if(msg.generation !== this.vga_worker_generation_at_dispatch)
+                {
+                    return;
+                }
+
+                if(msg.type === "svga-render-done")
+                {
+                    if(msg.rgba && msg.rgba_start !== undefined)
+                    {
+                        const colors = new Int32Array(msg.rgba);
+                        const buffer = new Int32Array(this.cpu.wasm_memory.buffer, this.dest_buffet_offset, this.screen_width * this.screen_height);
+                        buffer.set(colors, msg.rgba_start);
+                        this.screen.update_buffer([{
+                            image_data: this.image_data,
+                            screen_x: 0, screen_y: msg.min_y,
+                            buffer_x: 0, buffer_y: msg.min_y,
+                            buffer_width: this.svga_width,
+                            buffer_height: msg.max_y - msg.min_y,
+                        }]);
+                    }
+                }
+                else if(msg.type === "vga-webgpu-done")
+                {
+                    // Precomputed WebGPU payload
+                    if(msg.payload)
+                    {
+                        this.screen.update_buffer_webgpu(msg.payload);
+                    }
+                }
+                else if(msg.type === "vga-render-done")
+                {
+                    if(msg.pixel_values && msg.pixel_base_start !== undefined)
+                    {
+                        const patch = new Uint8Array(msg.pixel_values);
+                        this.pixel_buffer.set(patch, msg.pixel_base_start);
+                    }
+
+                    if(msg.rgba && msg.rgba_start !== undefined)
+                    {
+                        const colors = new Int32Array(msg.rgba);
+                        const buffer = new Int32Array(this.cpu.wasm_memory.buffer, this.dest_buffet_offset, this.virtual_width * this.virtual_height);
+                        buffer.set(colors, msg.rgba_start);
+                        this.screen.update_buffer(this.layers);
+                    }
+                }
+
+                this.reset_diffs();
+                this.update_vertical_retrace();
+            }
+        };
+
+        this.vga_worker.onerror = () =>
+        {
+            this.vga_worker_busy = false;
+            this.use_vga_worker = false;
+            this.vga_worker = null;
+        };
+    }
+    catch(e)
+    {
+        this.use_vga_worker = false;
+        this.vga_worker = null;
+    }
+
+    return this.vga_worker;
+};
+
+VGAScreen.prototype.try_vga_worker = function()
+{
+    if(!this.use_vga_worker || this.vga_worker_busy)
+    {
+        return false;
+    }
+
+    const worker = this.ensure_vga_worker();
+    if(!worker)
+    {
+        return false;
+    }
+
+    if(!this.virtual_width || !this.screen_width)
+    {
+        return false;
+    }
+
+    // SVGA 8bpp offload
+    if(this.svga_enabled)
+    {
+        const bytes_per_pixel = this.svga_bpp === 15 ? 2 : this.svga_bpp === 16 ? 2 : this.svga_bpp === 24 ? 3 : this.svga_bpp === 32 ? 4 : 1;
+
+        let min_y = 0;
+        let max_y = this.svga_height;
+
+        if(this.svga_bpp !== 8)
+        {
+            // replicate existing dirty tracking for non-8bpp path
+            this.cpu.svga_fill_pixel_buffer(this.svga_bpp, this.svga_offset);
+
+            const bpp_bytes = bytes_per_pixel;
+            min_y = (((this.cpu.svga_dirty_bitmap_min_offset[0] / bpp_bytes | 0) - this.svga_offset) / this.svga_width | 0);
+            max_y = (((this.cpu.svga_dirty_bitmap_max_offset[0] / bpp_bytes | 0) - this.svga_offset) / this.svga_width | 0) + 1;
+        }
+
+        if(min_y < 0) min_y = 0;
+        if(max_y > this.svga_height) max_y = this.svga_height;
+
+        const region_rows = max_y - min_y;
+        if(region_rows <= 0)
+        {
+            this.update_vertical_retrace();
+            return true;
+        }
+
+        const start = this.svga_offset + min_y * this.svga_width * bytes_per_pixel;
+        const length = region_rows * this.svga_width * bytes_per_pixel;
+        const svga_memory = new Uint8Array(this.cpu.wasm_memory.buffer, this.svga_memory.byteOffset + start, length).slice();
+
+        const palette = this.svga_bpp === 8 ? new Int32Array(this.vga256_palette) : null;
+
+        this.vga_worker_busy = true;
+        this.vga_worker_generation_at_dispatch = this.vga_worker_generation;
+        this.vga_worker_pending_mode = "svga";
+
+        const transfer = [svga_memory.buffer];
+        if(palette) transfer.push(palette.buffer);
+
+        worker.postMessage({
+            type: "svga-render",
+            generation: this.vga_worker_generation,
+            width: this.svga_width,
+            height: this.svga_height,
+            min_y,
+            max_y,
+            bpp: this.svga_bpp,
+            palette,
+            svga_memory,
+        }, transfer);
+
+        return true;
+    }
+
+    const has_plot = this.diff_plot_max > this.diff_plot_min;
+    const has_addr = this.diff_addr_max > this.diff_addr_min;
+    if(!has_plot && !has_addr)
+    {
+        // Nothing to do
+        this.update_vertical_retrace();
+        return true;
+    }
+
+    const diff_plot_min = Math.max(0, this.diff_plot_min & ~0xF);
+    const diff_plot_max = Math.min((this.diff_plot_max | 0xF), VGA_PIXEL_BUFFER_SIZE - 1);
+    const diff_addr_min = Math.max(0, this.diff_addr_min);
+    const diff_addr_max = Math.min(this.diff_addr_max, VGA_PIXEL_BUFFER_SIZE - 1);
+
+    const pixel_base_start = Math.min(diff_plot_min, diff_addr_min);
+    const pixel_base_end = Math.max(diff_plot_max, diff_addr_max);
+    const pixel_seed = this.pixel_buffer.slice(pixel_base_start, pixel_base_end + 1);
+
+    const palette = new Int32Array(this.vga256_palette);
+    const dac_map = new Uint8Array(this.dac_map);
+
+    this.vga_worker_busy = true;
+    this.vga_worker_generation_at_dispatch = this.vga_worker_generation;
+    this.vga_worker_pending_mode = "vga";
+
+    const transfer = [
+        pixel_seed.buffer,
+        palette.buffer,
+        dac_map.buffer,
+    ];
+
+    const planes = [
+        new Uint8Array(this.plane0),
+        new Uint8Array(this.plane1),
+        new Uint8Array(this.plane2),
+        new Uint8Array(this.plane3),
+    ];
+
+    planes.forEach(p => transfer.push(p.buffer));
+
+    worker.postMessage({
+        type: "vga-render",
+        generation: this.vga_worker_generation,
+        virtual_width: this.virtual_width,
+        start_address: this.start_address,
+        crtc_mode: this.crtc_mode,
+        underline_location_register: this.underline_location_register,
+        planar_mode: this.planar_mode,
+        attribute_mode: this.attribute_mode,
+        color_select: this.color_select,
+        color_plane_enable: this.color_plane_enable,
+        diff_plot_min,
+        diff_plot_max,
+        diff_addr_min,
+        diff_addr_max,
+        pixel_base_start,
+        pixel_seed,
+        palette,
+        dac_map,
+        plane0: planes[0],
+        plane1: planes[1],
+        plane2: planes[2],
+        plane3: planes[3],
+    }, transfer);
+
+    return true;
 };
 
 VGAScreen.prototype.destroy = function()
@@ -2687,6 +2935,11 @@ VGAScreen.prototype.screen_fill_buffer = function()
 
         if(this.svga_bpp === 8)
         {
+            if(this.try_vga_worker())
+            {
+                return;
+            }
+
             // XXX: Slow, should be ported to rust, but it doesn't have access to vga256_palette
             // XXX: Doesn't take svga_offset into account
             const buffer = new Int32Array(this.cpu.wasm_memory.buffer, this.dest_buffet_offset, this.screen_width * this.screen_height);
@@ -2727,21 +2980,34 @@ VGAScreen.prototype.screen_fill_buffer = function()
                 }]);
             }
         }
+
+        this.reset_diffs();
+        this.update_vertical_retrace();
+        return;
     }
-    else
+
+    if(use_webgpu)
     {
-        if(use_webgpu)
+        if(this.try_vga_worker())
         {
-            // GPU handles planar unpack + palette
-            this.screen.update_buffer_webgpu(this.webgpu_payload_vga_planar());
+            return;
         }
-        else
-        {
-            this.vga_replot();
-            this.vga_redraw();
-            this.screen.update_buffer(this.layers);
-        }
+
+        // GPU handles planar unpack + palette
+        this.screen.update_buffer_webgpu(this.webgpu_payload_vga_planar());
+        this.reset_diffs();
+        this.update_vertical_retrace();
+        return;
     }
+
+    if(this.try_vga_worker())
+    {
+        return;
+    }
+
+    this.vga_replot();
+    this.vga_redraw();
+    this.screen.update_buffer(this.layers);
 
     this.reset_diffs();
     this.update_vertical_retrace();

@@ -1002,6 +1002,14 @@ CPU.prototype.init = function(settings, device_bus)
 
     settings.cpuid_level && this.set_cpuid_level(settings.cpuid_level);
 
+    // Multicore plumbing: keep requested value for future SMP work, but clamp to 1 for now.
+    this.requested_cpu_count = Math.max(1, settings.cpu_count | 0 || 1);
+    if(this.requested_cpu_count > 1)
+    {
+        dbg_log("Multicore requested (" + this.requested_cpu_count + "), but SMP execution isn't implemented yet; falling back to 1 core", LOG_CPU);
+    }
+    this.cpu_count = 1;
+
     this.acpi_enabled[0] = +settings.acpi;
 
     this.reset_cpu();
@@ -1095,11 +1103,11 @@ CPU.prototype.init = function(settings, device_bus)
         }
         else if(value === FW_CFG_NB_CPUS)
         {
-            this.fw_value = i32(1);
+            this.fw_value = i32(this.cpu_count);
         }
         else if(value === FW_CFG_MAX_CPUS)
         {
-            this.fw_value = i32(1);
+            this.fw_value = i32(this.cpu_count);
         }
         else if(value === FW_CFG_NUMA)
         {
@@ -1669,7 +1677,9 @@ CPU.prototype.fill_cmos = function(rtc, settings)
 
     rtc.cmos_write(CMOS_EQUIPMENT_INFO, 0x2F);
 
-    rtc.cmos_write(CMOS_BIOS_SMP_COUNT, 0);
+    // CMOS SMP count is typically (cpus - 1); keep aligned with current single-core implementation.
+    const smp_count = Math.max(0, this.cpu_count - 1);
+    rtc.cmos_write(CMOS_BIOS_SMP_COUNT, smp_count);
 
     // Used by bochs BIOS to skip the boot menu delay.
     if(settings.fastboot) rtc.cmos_write(0x3f, 0x01);

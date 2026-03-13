@@ -863,7 +863,7 @@ pub unsafe fn call_interrupt_vector(
             dbg_trace();
             dbg_assert!(descriptor.is_32(), "TODO: Check this (likely #GP)");
             dbg_assert!(offset == 0, "TODO: Check this (likely #GP)");
-            do_task_switch(selector, error_code);
+            do_task_switch(selector, TaskSwitchSource::Interrupt(error_code));
             return;
         }
 
@@ -1380,8 +1380,30 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
 
             update_state_flags();
         }
-        else if info.system_type() == 1 || info.system_type() == 9 {
-            dbg_assert!(false, "TODO: far call task gate");
+        else if info.system_type() == 1 || info.system_type() == 9 || info.system_type() == 5 {
+            let tss_selector;
+            if info.system_type() == 5 {
+                // Task gate
+                tss_selector = (info.raw >> 16) as i32;
+                if info.dpl() < *cpl || info.dpl() < cs_selector.rpl() {
+                    dbg_log!("#gp task gate dpl < cpl: {:x}", selector);
+                    trigger_gp(selector & !3);
+                    return;
+                }
+                if !info.is_present() {
+                    trigger_np(selector & !3);
+                    return;
+                }
+            } else {
+                // TSS descriptor
+                tss_selector = selector;
+                if info.dpl() < *cpl || info.dpl() < cs_selector.rpl() {
+                    dbg_log!("#gp tss dpl < cpl: {:x}", selector);
+                    trigger_gp(selector & !3);
+                    return;
+                }
+            }
+            let source = if is_call { TaskSwitchSource::FarCall } else { TaskSwitchSource::FarJmp }; do_task_switch(tss_selector, source);
         }
         else {
             dbg_assert!(false, "TODO: #gp invalid system type");
@@ -1592,7 +1614,16 @@ pub unsafe fn far_return(eip: i32, selector: i32, stack_adjust: i32, is_osize_32
     update_state_flags();
 }
 
-pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>) {
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum TaskSwitchSource {
+    Interrupt(Option<i32>),
+    FarCall,
+    FarJmp,
+    Iret,
+}
+
+pub unsafe fn do_task_switch(selector: i32, source: TaskSwitchSource) {
     dbg_log!("do_task_switch sel={:x}", selector);
 
     dbg_assert!(*tss_size_32, "TODO: 16-bit TSS in task switch");
@@ -1795,7 +1826,7 @@ pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>) {
 
     *cr.offset(0) |= CR0_TS;
 
-    if let Some(error_code) = error_code {
+    if let TaskSwitchSource::Interrupt(Some(error_code)) = source {
         if tss_is_16 {
             push16(error_code & 0xFFFF).unwrap();
         }
@@ -3239,6 +3270,32 @@ pub unsafe fn trigger_gp(code: i32) {
         }
     }
     call_interrupt_vector(CPU_EXCEPTION_GP, false, Some(code));
+}
+
+#[inline(never)]
+pub unsafe fn trigger_mf() {
+    dbg_log!("#mf eip={:x}", *previous_ip);
+    dbg_trace();
+    *instruction_pointer = *previous_ip;
+    if DEBUG {
+        if js::cpu_exception_hook(CPU_EXCEPTION_MF) {
+            return;
+        }
+    }
+    call_interrupt_vector(CPU_EXCEPTION_MF, false, None);
+}
+
+#[inline(never)]
+pub unsafe fn trigger_xm() {
+    dbg_log!("#xm eip={:x}", *previous_ip);
+    dbg_trace();
+    *instruction_pointer = *previous_ip;
+    if DEBUG {
+        if js::cpu_exception_hook(CPU_EXCEPTION_XM) {
+            return;
+        }
+    }
+    call_interrupt_vector(CPU_EXCEPTION_XM, false, None);
 }
 
 #[cold]

@@ -5,8 +5,12 @@
 <meta name="viewport" content="width=device-width,minimum-scale=1.0,maximum-scale=1.0,user-scalable=no,interactive-widget=resizes-content">
 
 <script>
-// Prefer WebGPU worker rendering in debug build; override via console if needed.
-window.USE_WEBGPU_WORKER = true;
+// Prefer WebGPU rendering and disk fetch offload via workers in debug; override via console if needed.
+window.USE_WEBGPU_WORKER = false;
+window.USE_DISK_WORKER = true;
+window.USE_TICK_WORKER = true;
+window.USE_MARSHALL_WORKER = true;
+window.USE_VGA_WORKER = true;
 </script>
 <script src="build/capstone-x86.min.js"></script>
 <script src="build/libwabt.cjs"></script>
@@ -141,6 +145,23 @@ window.USE_WEBGPU_WORKER = true;
                 <td><label for="memory_size">Memory size</label></td>
                 <td>
                     <input id="memory_size" type="number" value="128" min="16" max="2048" step="16"> MB<br>
+                </td>
+            </tr>
+
+            <tr>
+                <td><label for="cpu_count">CPU cores</label></td>
+                <td>
+                    <input id="cpu_count" type="number" value="1" min="1" max="8" step="1"> cores<br>
+                </td>
+            </tr>
+
+            <tr>
+                <td><label for="clock_source">Clock source</label></td>
+                <td>
+                    <select id="clock_source">
+                        <option value="hpet" selected>HPET (default)</option>
+                        <option value="native">Native timer</option>
+                    </select>
                 </td>
             </tr>
 

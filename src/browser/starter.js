@@ -30,6 +30,7 @@ import { FS } from "../../lib/filesystem.js";
  * @param {{
       disable_mouse: (boolean|undefined),
       disable_keyboard: (boolean|undefined),
+            clock_source: ("hpet"|"native"|undefined),
       wasm_fn: (Function|undefined),
       screen: ({
           scale: (number|undefined),
@@ -177,7 +178,11 @@ export function V86(options)
             wasm_memory = exports.memory;
             exports["rust_init"]();
 
-            const emulator = this.v86 = new v86(this.emulator_bus, { exports, wasm_table });
+            const emulator = this.v86 = new v86(this.emulator_bus, {
+                exports,
+                wasm_table,
+                clock_source: options.clock_source,
+            });
             cpu = emulator.cpu;
 
             this.continue_init(emulator, options);
@@ -213,6 +218,7 @@ V86.prototype.continue_init = async function(emulator, options)
     settings.load_devices = true;
     settings.memory_size = options.memory_size || 64 * 1024 * 1024;
     settings.vga_memory_size = options.vga_memory_size || 8 * 1024 * 1024;
+    settings.cpu_count = Math.max(1, options.cpu_count || 1);
     settings.boot_order = boot_order;
     settings.fastboot = options.fastboot || false;
     settings.fda = undefined;

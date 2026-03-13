@@ -1,5 +1,8 @@
 import { CPU } from "./cpu.js";
 import { load_file, get_file_size } from "./lib.js";
+
+// Optional offthread disk fetch (shared with browser disk worker).
+import { load_file_offthread } from "./browser/filestorage.js";
 import { dbg_assert, dbg_log } from "./log.js";
 
 // The smallest size the emulated hardware can emit
@@ -438,69 +441,55 @@ AsyncXHRPartfileBuffer.prototype.get = function(offset, len, fn)
         const blocks = new Uint8Array(total_count * this.fixed_chunk_size);
         let finished = 0;
 
+        const finish_if_done = () => {
+            if(finished === total_count)
+            {
+                fn(blocks.subarray(m_offset, m_offset + len));
+            }
+        };
+
         for(let i = 0; i < total_count; i++)
         {
-            const offset = (start_index + i) * this.fixed_chunk_size;
+            const part_offset = (start_index + i) * this.fixed_chunk_size;
 
             const part_filename =
                 this.partfile_alt_format ?
-                    // matches output of gnu split:
-                    //   split -b 512 -a8 -d --additional-suffix .img w95.img w95-
                     this.basename + (start_index + i + "").padStart(8, "0") + this.extension
                 :
-                    this.basename + offset + "-" + (offset + this.fixed_chunk_size) + this.extension;
+                    this.basename + part_offset + "-" + (part_offset + this.fixed_chunk_size) + this.extension;
 
-            // XXX: unnecessary allocation
-            const block = this.get_from_cache(offset, this.fixed_chunk_size);
-
-            if(block)
+            const cached = this.get_from_cache(part_offset, this.fixed_chunk_size);
+            if(cached)
             {
+                blocks.set(cached, i * this.fixed_chunk_size);
+                finished++;
+                finish_if_done();
+                continue;
+            }
+
+            load_file_offthread(part_filename, { progress: this.onprogress }).then(buffer => {
+                const block = new Uint8Array(buffer);
+                this.handle_read(part_offset, this.fixed_chunk_size, block);
                 blocks.set(block, i * this.fixed_chunk_size);
                 finished++;
-                if(finished === total_count)
-                {
-                    fn(blocks.subarray(m_offset, m_offset + len));
-                }
-            }
-            else
-            {
-                load_file(part_filename, {
-                    done: async function done(buffer)
-                    {
-                        let block = new Uint8Array(buffer);
-
-                        if(this.is_zstd)
-                        {
-                            const decompressed = await this.zstd_decompress(this.fixed_chunk_size, block);
-                            block = new Uint8Array(decompressed);
-                        }
-
-                        blocks.set(block, i * this.fixed_chunk_size);
-                        this.handle_read((start_index + i) * this.fixed_chunk_size, this.fixed_chunk_size|0, block);
-
-                        finished++;
-                        if(finished === total_count)
-                        {
-                            fn(blocks.subarray(m_offset, m_offset + len));
-                        }
-                    }.bind(this),
-                });
-            }
+                finish_if_done();
+            }).catch(() => {
+                finished++;
+                finish_if_done();
+            });
         }
     }
     else
     {
         const part_filename = this.basename + offset + "-" + (offset + len) + this.extension;
 
-        load_file(part_filename, {
-            done: function done(buffer)
-            {
-                dbg_assert(buffer.byteLength === len);
-                var block = new Uint8Array(buffer);
-                this.handle_read(offset, len, block);
-                fn(block);
-            }.bind(this),
-        });
+        load_file_offthread(part_filename, {}).then(buffer =>
+        {
+            dbg_assert(buffer.byteLength === len);
+            const block = new Uint8Array(buffer);
+            this.handle_read(offset, len, block);
+            fn(block);
+        }).catch(() => fn(new Uint8Array(len)));
     }
 };
 

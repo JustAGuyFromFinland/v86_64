@@ -337,6 +337,14 @@ export interface V86Options {
     disable_jit?: boolean;
 
     /**
+     * Host-side emulator scheduling clock source.
+     * `hpet` uses a high-resolution worker-backed timer (default),
+     * `native` uses the plain timer path.
+     * @default "hpet"
+     */
+    clock_source?: "hpet" | "native";
+
+    /**
      * The url of a server running websockproxy
      * Deprecated in favor of the net_device config below
      */

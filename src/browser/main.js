@@ -11,6 +11,8 @@ const ON_LOCALHOST = !location.hostname.endsWith("copy.sh");
 const DEFAULT_NETWORKING_PROXIES = ["wss://relay.widgetry.org/", "ws://localhost:8080/"];
 const DEFAULT_MEMORY_SIZE = 128;
 const DEFAULT_VGA_MEMORY_SIZE = 8;
+const DEFAULT_CPU_COUNT = 1;
+const DEFAULT_CLOCK_SOURCE = "hpet";
 const DEFAULT_BOOT_ORDER = 0;
 const DEFAULT_MTU = 1500;
 const DEFAULT_NIC_TYPE = "ne2k";
@@ -191,7 +193,7 @@ function onload()
                 "root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose",
                 "mitigations=off audit=0",
                 "init_on_free=on",
-                "tsc=reliable",
+                "clocksource=hpet",
                 "random.trust_cpu=on",
                 "nowatchdog",
                 "init=/usr/bin/init-openrc net.ifnames=0 biosdevname=0",
@@ -516,7 +518,7 @@ function onload()
             },
             name: "Buildroot Linux",
             filesystem: {},
-            cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
+            cmdline: "clocksource=hpet mitigations=off random.trust_cpu=on",
             mouse_disabled_default: true,
         },
         {
@@ -528,7 +530,7 @@ function onload()
             },
             name: "Buildroot Linux 6.8",
             filesystem: {},
-            cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
+            cmdline: "clocksource=hpet mitigations=off random.trust_cpu=on",
         },
         {
             id: "basiclinux",
@@ -567,7 +569,7 @@ function onload()
                 async: false,
             },
             name: "NodeOS",
-            cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
+            cmdline: "clocksource=hpet mitigations=off random.trust_cpu=on",
         },
         {
             id: "dsl",
@@ -1771,6 +1773,7 @@ function onload()
     if(query_args.has("mute")) $("disable_audio").checked = bool_arg(query_args.get("mute"));
     if(query_args.has("acpi")) $("acpi").checked = bool_arg(query_args.get("acpi"));
     if(query_args.has("boot_order")) $("boot_order").value = query_args.get("boot_order");
+    if(query_args.has("clock") && $("clock_source")) $("clock_source").value = query_args.get("clock");
     if(query_args.has("net_device_type")) $("net_device_type").value = query_args.get("net_device_type");
     if(query_args.has("mtu")) $("mtu").value = query_args.get("mtu");
 
@@ -2073,6 +2076,7 @@ function start_emulation(profile, query_args)
         settings.acpi = profile.acpi;
         settings.memory_size = profile.memory_size;
         settings.vga_memory_size = profile.vga_memory_size;
+        settings.cpu_count = profile.cpu_count;
         settings.boot_order = profile.boot_order;
         settings.net_device_type = profile.net_device_type;
 
@@ -2181,6 +2185,18 @@ function start_emulation(profile, query_args)
         settings.relay_url = query_args.get("relay_url");
         settings.disable_jit = bool_arg(query_args.get("disable_jit"));
         settings.disable_audio = bool_arg(query_args.get("mute"));
+
+        const cpus = parseInt(query_args.get("cpus"), 10);
+        if(cpus > 0)
+        {
+            settings.cpu_count = Math.max(1, Math.min(8, cpus));
+        }
+
+        const clock_source = query_args.get("clock");
+        if(clock_source === "hpet" || clock_source === "native")
+        {
+            settings.clock_source = clock_source;
+        }
     }
 
     if(!settings.relay_url)
@@ -2289,6 +2305,19 @@ function start_emulation(profile, query_args)
         }
         if(memory_size !== DEFAULT_MEMORY_SIZE) new_query_args.set("m", String(memory_size));
 
+        const cpu_count = parseInt($("cpu_count").value, 10) || DEFAULT_CPU_COUNT;
+        if(!settings.cpu_count || cpu_count !== DEFAULT_CPU_COUNT)
+        {
+            settings.cpu_count = Math.max(1, Math.min(8, cpu_count));
+        }
+        if(settings.cpu_count !== DEFAULT_CPU_COUNT) new_query_args.set("cpus", String(settings.cpu_count));
+
+        const selected_clock = $("clock_source")?.value;
+        if(selected_clock === "hpet" || selected_clock === "native")
+        {
+            settings.clock_source = selected_clock;
+        }
+
         const vga_memory_size = parseInt($("vga_memory_size").value, 10) || DEFAULT_VGA_MEMORY_SIZE;
         if(!settings.vga_memory_size || vga_memory_size !== DEFAULT_VGA_MEMORY_SIZE)
         {
@@ -2341,6 +2370,21 @@ function start_emulation(profile, query_args)
 
     }
 
+    if(!settings.cpu_count)
+    {
+        settings.cpu_count = DEFAULT_CPU_COUNT;
+    }
+
+    if(!settings.clock_source)
+    {
+        settings.clock_source = DEFAULT_CLOCK_SOURCE;
+    }
+
+    if(settings.clock_source !== DEFAULT_CLOCK_SOURCE)
+    {
+        new_query_args.set("clock", settings.clock_source);
+    }
+
     if(!query_args)
     {
         push_state(new_query_args);
@@ -2384,6 +2428,8 @@ function start_emulation(profile, query_args)
         disable_speaker: settings.disable_audio,
         mac_address_translation: settings.mac_address_translation,
         cpuid_level: settings.cpuid_level,
+        cpu_count: settings.cpu_count,
+        clock_source: settings.clock_source,
     });
 
     if(DEBUG) window.emulator = emulator;
